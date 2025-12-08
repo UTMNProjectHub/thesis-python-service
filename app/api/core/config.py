@@ -1,7 +1,7 @@
+from __future__ import annotations
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-from __future__ import annotations
 
 from pydantic_settings import BaseSettings
 
