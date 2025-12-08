@@ -40,10 +40,10 @@ class RabbitClient:
         )
 
         # Названия очередей
-        self.queue_quiz_gen = "quiz.gen"
-        self.queue_summary_gen = "summary.gen"
-        self.queue_quiz_gen_complete = "quiz.gen.complete"
-        self.queue_summary_gen_complete = "summary.gen.complete"
+        self.queue_quiz_gen = "quiz.generation.request"
+        self.queue_summary_gen = "summary.generation.request"
+        self.queue_quiz_gen_complete = "quiz.generation.complete"
+        self.queue_summary_gen_complete = "summary.generation.complete"
 
     # ======================================================================
     # 1. ПУБЛИКАЦИЯ СООБЩЕНИЙ
