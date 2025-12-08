@@ -166,21 +166,22 @@ class RabbitClient:
 
 def get_rabbit_client() -> RabbitClient:
     """
-    Фабрика, которая берёт AMQP_URL из .env и создаёт RabbitClient.
-    AMQP_URL вида: amqp://user:pass@host:port/vhost
+    Фабрика RabbitClient, берёт строку подключения из settings.amqp_url
+    (переменная окружения / .env: AMQP_URL=amqp://user:pass@host:5672/vhost).
     """
-    url = urlparse(settings.AMQP_URL)
+    # было: settings.AMQP_URL
+    url = urlparse(settings.amqp_url)
 
-    host = url.hostname or "localhost"
-    port = url.port or 5672
     username = url.username or "guest"
     password = url.password or "guest"
-    vhost = url.path[1:] if url.path else "/"
+    host = url.hostname or "localhost"
+    port = url.port or 5672
+    vhost = url.path[1:] if url.path.startswith("/") else "/"
 
     return RabbitClient(
         host=host,
         port=port,
         username=username,
         password=password,
-        vhost=vhost or "/",
+        vhost=vhost,
     )
