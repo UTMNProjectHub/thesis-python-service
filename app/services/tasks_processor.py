@@ -76,7 +76,7 @@ class TaskProcessor:
             matching_pairs: List[MatchingPair] | None = None
 
             if isinstance(q, TrueFalseQuestion):
-                q_type = "true_false"
+                q_type = "truefalse"
                 variants = [
                     AnswerVariant(id="True", text="True", is_correct=q.answer, explanation=""),
                     AnswerVariant(id="False", text="False", is_correct=not q.answer, explanation=""),
@@ -84,7 +84,7 @@ class TaskProcessor:
                 correct_answer = "True" if q.answer else "False"
 
             elif isinstance(q, MultipleChoiceQuestion):
-                q_type = "multiple_choice"
+                q_type = "multichoice"
                 variants = [
                     AnswerVariant(
                         id=chr(65 + i),
@@ -97,6 +97,7 @@ class TaskProcessor:
                 correct_answer = q.options[q.answer]
 
             elif isinstance(q, SelectAllThatApplyQuestion):
+                continue
                 q_type = "select_all_that_apply"
                 variants = [
                     AnswerVariant(
@@ -110,6 +111,7 @@ class TaskProcessor:
                 correct_answer = [q.options[i] for i in q.answer]
 
             elif isinstance(q, FillInTheBlankQuestion):
+                continue
                 q_type = "fill_in_the_blank"
                 correct_answer = q.answer
 
@@ -122,7 +124,7 @@ class TaskProcessor:
                 correct_answer = [f"{p.left_option} → {p.right_option}" for p in q.answer]
 
             elif isinstance(q, ShortOrLongAnswerQuestion):
-                q_type = "short_answer" if len(q.answer) < 250 else "long_answer"
+                q_type = "shortanswer" if len(q.answer) < 250 else "essay"
                 correct_answer = q.answer
 
             else:
@@ -173,7 +175,7 @@ class TaskProcessor:
             quiz_id=quiz_id,
             theme_id=theme_id,
             name="Авто-квиз",
-            description="Сгенерировано автоматически на основе конспекта.",
+            description="Квиз для провеки знания темы.",
         )
 
         for q in questions:
@@ -184,7 +186,7 @@ class TaskProcessor:
                 question_id=q_db_id,
                 qtype=q.type,
                 text=q.text,
-                multi_answer=multi_answer,
+                multi_answer='matching',
             )
 
             # ссылки вопрос ↔ файл(ы)
@@ -421,7 +423,9 @@ class TaskProcessor:
         file_ids = [UUID(fid) for fid in payload["files"]]
         difficulty = payload.get("difficulty", "medium")
         question_count = payload.get("question_count", 10)
+        question_types = payload.get("question_types", ["multichoice", "matching", "truefalse"])
         additional_req = payload.get("additional_requirements") or ""
+        themeId = int(payload.get("themeId", ""))
 
         try:
             # 1) s3Index → S3
@@ -457,16 +461,16 @@ class TaskProcessor:
                 num_true_false=max(1, question_count // 5),
                 generate_multiple_choice=True,
                 num_multiple_choice=max(1, question_count // 2),
-                generate_select_all_that_apply=True,
-                num_select_all_that_apply=max(1, question_count // 5),
+                generate_select_all_that_apply=False,
+                num_select_all_that_apply=0,
                 generate_fill_in_the_blank=False,
                 num_fill_in_the_blank=0,
-                generate_matching=False,
-                num_matching=0,
-                generate_short_answer=False,
-                num_short_answer=0,
-                generate_long_answer=False,
-                num_long_answer=0,
+                generate_matching=True,
+                num_matching=max(1, question_count // 5),
+                generate_short_answer=True,
+                num_short_answer=1,
+                generate_long_answer=True,
+                num_long_answer=1,
             )
 
             raw_questions = await generate_quiz_from_text(note_text, cfg)
@@ -482,7 +486,7 @@ class TaskProcessor:
             # 5) сохранение в Postgres
             await self._persist_quiz(
                 quiz_id=quiz_id,
-                theme_id=None,
+                theme_id=themeId,
                 questions=quiz_questions,
                 file_ids=file_ids,
             )
