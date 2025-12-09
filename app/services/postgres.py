@@ -25,7 +25,7 @@ class PostgresClient:
         if self._pool:
             return self._pool
         self._pool = await asyncpg.create_pool(
-            dsn=settings.DATABASE_URL,
+            dsn=settings.database_url,
             min_size=1,
             max_size=10,
         )

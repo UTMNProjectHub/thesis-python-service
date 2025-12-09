@@ -52,7 +52,7 @@ async def generate_explanations(
             else:
                 variant.explanation = exp
     else:  # Open-ended: только общее для правильного
-        question.general_explanation = _explain_general_correct(
+        question.general_explanation = await _explain_general_correct(
             base_prompt=base_prompt,
             correct_answer=question.correct_answer,
             difficulty_hint=difficulty_hint
