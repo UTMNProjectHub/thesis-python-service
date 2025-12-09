@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from uuid import uuid4, UUID
 
 from app.services.s3_client import S3Client
