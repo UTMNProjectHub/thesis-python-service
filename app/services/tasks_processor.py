@@ -12,6 +12,7 @@ from app.services.rabbitmq import RabbitClient
 
 # Для SUMMARY (конспект)
 from app.documents.pdf_reader import load_pdf_document
+from app.utils.pdf_utils import extract_text_from_pdf
 from app.documents.chunking import chunk_document_pages
 from app.documents.indexers import HybridRetriever
 from app.curriculum.models import LectureTopic, DifficultyLevel
@@ -436,9 +437,15 @@ class TaskProcessor:
                 if p.suffix.lower() in (".md", ".txt"):
                     note_text += p.read_text(encoding="utf-8") + "\n\n"
                 elif p.suffix.lower() == ".pdf":
-                    # можно использовать extract_text_from_pdf, но чтобы не усложнять:
-                    # просто пропускаем или добавляем заглушку
-                    pass
+                    # читаем текст из PDF
+                    try:
+                        pdf_text = extract_text_from_pdf(str(p))
+                    except Exception as e:
+                        # при желании можно просто залогировать и continue
+                        raise RuntimeError(f"Не удалось прочитать PDF '{p}': {e}")
+
+                    if pdf_text.strip():
+                        note_text += pdf_text + "\n\n"
 
             if not note_text.strip():
                 raise RuntimeError("Нет текстового содержимого для генерации квиза")
