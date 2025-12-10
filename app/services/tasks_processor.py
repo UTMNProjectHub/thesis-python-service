@@ -5,6 +5,7 @@ import asyncio
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4, UUID
+import random
 
 from app.services.s3_client import S3Client
 from app.services.postgres import PostgresClient
@@ -37,8 +38,72 @@ from app.quiz.models import (
     AnswerVariant,
     MatchingPair,
     Question,  # union тип
+    QuestionType
 )
 
+UI_TO_INTERNAL: dict[str, QuestionType] = {
+    "truefalse": "true_false",
+    "multichoice": "multiple_choice",
+    "matching": "matching",
+    "shortanswer": "short_answer",
+    "essay": "long_answer",
+    "numerical": "fill_in_the_blank",  # либо отдельная логика, если понадобится
+}
+
+INTERNAL_TO_DB: dict[QuestionType, str] = {
+    "true_false": "truefalse",
+    "multiple_choice": "multichoice",
+    "matching": "matching",
+    "short_answer": "shortanswer",
+    "long_answer": "essay",
+}
+
+
+def _distribute_question_counts(
+        total: int,
+        ui_types: list[str],
+) -> dict[str, int]:
+    """
+    Распределяет total вопросов по типам из ui_types
+    (multichoice|essay|matching|truefalse|shortanswer|numerical).
+
+    - numerical игнорируется;
+    - если total >= len(types) -> каждому минимум 1, остальное раскидывается случайно;
+    - если total < len(types)  -> ровно total типов получают по 1 вопросу.
+    """
+    # отфильтровали numerical
+    types = [t for t in ui_types if t != "numerical"]
+
+    # если после фильтра ничего не осталось — дефолтный тип
+    if not types:
+        types = ["multichoice"]
+
+    n = len(types)
+    if total <= 0:
+        return {t: 0 for t in types}
+
+    # total >= n — каждому минимум по одному, плюс равномерный остаток
+    if total >= n:
+        base = total // n          # минимум для каждого типа
+        remainder = total % n      # сколько "лишних" вопросов раскидываем
+
+        counts = {t: base for t in types}
+
+        # если базовое распределение дало всем >=1? при total>=n base всегда >=1
+        # остаток распределяем случайно по типам
+        if remainder > 0:
+            extra_types = random.sample(types, k=remainder)
+            for t in extra_types:
+                counts[t] += 1
+    else:
+        # total < n — типов больше, чем вопросов.
+        # Выбираем случайные total типов, им даём по 1 вопросу.
+        counts = {t: 0 for t in types}
+        chosen = random.sample(types, k=total)
+        for t in chosen:
+            counts[t] = 1
+
+    return counts
 
 class TaskProcessor:
     """
@@ -66,17 +131,20 @@ class TaskProcessor:
     # ------------------------------------------------------------------
     # ВСПОМОГАТЕЛЬНОЕ: конвертация raw_questions → QuizQuestion
     # ------------------------------------------------------------------
-    def _convert_raw_to_quiz_questions(self, raw_questions: List[Question]) -> List[QuizQuestion]:
+    def _convert_raw_to_quiz_questions(
+            self, raw_questions: List[Question],
+            allowed_types: Optional[set[QuestionType]] = None,
+    ) -> List[QuizQuestion]:
         questions: List[QuizQuestion] = []
 
         for q in raw_questions:
-            q_type: str
+            q_type: QuestionType
             variants: List[AnswerVariant] | None = None
             correct_answer = None
             matching_pairs: List[MatchingPair] | None = None
 
             if isinstance(q, TrueFalseQuestion):
-                q_type = "truefalse"
+                q_type = "true_false"
                 variants = [
                     AnswerVariant(id="True", text="True", is_correct=q.answer, explanation=""),
                     AnswerVariant(id="False", text="False", is_correct=not q.answer, explanation=""),
@@ -84,7 +152,7 @@ class TaskProcessor:
                 correct_answer = "True" if q.answer else "False"
 
             elif isinstance(q, MultipleChoiceQuestion):
-                q_type = "multichoice"
+                q_type = "multiple_choice"
                 variants = [
                     AnswerVariant(
                         id=chr(65 + i),
@@ -124,11 +192,14 @@ class TaskProcessor:
                 correct_answer = [f"{p.left_option} → {p.right_option}" for p in q.answer]
 
             elif isinstance(q, ShortOrLongAnswerQuestion):
-                q_type = "shortanswer" if len(q.answer) < 250 else "essay"
+                q_type = "short_answer" if len(q.answer) < 250 else "long_answer"
                 correct_answer = q.answer
 
             else:
                 # неизвестный тип — пропускаем
+                continue
+
+            if allowed_types is not None and q_type not in allowed_types:
                 continue
 
             qq = QuizQuestion(
@@ -169,24 +240,28 @@ class TaskProcessor:
             theme_id: Optional[int],
             questions: List[QuizQuestion],
             file_ids: List[UUID],
+            theme_name: Optional[str] = None,
     ) -> None:
         # метаданные квиза
+        quiz_name = f"Авто-квиз по теме «{theme_name}»" if theme_name else "Авто-квиз"
         await self.db.save_quiz_metadata(
             quiz_id=quiz_id,
             theme_id=theme_id,
-            name="Авто-квиз",
-            description="Квиз для провеки знания темы.",
+            name=quiz_name,
+            description="Квиз для провeрки знаний темы.",
         )
 
         for q in questions:
             q_db_id = uuid4()
+
+            db_qtype = INTERNAL_TO_DB[q.type]
             multi_answer = q.type in ("select_all_that_apply", "matching")
 
             await self.db.insert_question(
                 question_id=q_db_id,
-                qtype=q.type,
+                qtype=db_qtype,
                 text=q.text,
-                multi_answer='matching',
+                multi_answer=multi_answer,
             )
 
             # ссылки вопрос ↔ файл(ы)
@@ -423,11 +498,45 @@ class TaskProcessor:
         file_ids = [UUID(fid) for fid in payload["files"]]
         difficulty = payload.get("difficulty", "medium")
         question_count = payload.get("question_count", 10)
-        question_types = payload.get("question_types", ["multichoice", "matching", "truefalse"])
+        raw_qtypes = payload.get("question_types") or ["multichoice", "matching", "truefalse"]
         additional_req = payload.get("additional_requirements") or ""
-        themeId = int(payload.get("themeId", ""))
+        theme_id_raw = payload.get("themeId")
+        theme_id: Optional[int] = int(theme_id_raw) if theme_id_raw is not None else None
+
+        internal_allowed: set[QuestionType] = set()
+        for t in raw_qtypes:
+            t_norm = t.lower()
+            if t_norm in UI_TO_INTERNAL:
+                internal_allowed.add(UI_TO_INTERNAL[t_norm])
+
+        if not internal_allowed:
+            internal_allowed = {"multiple_choice", "matching", "true_false"}
+
+        # Допустимые типы для БД (у вас они: multichoice|essay|matching|truefalse|shortanswer|numerical)
+        allowed_db_types: set[str] = set()
+        if "truefalse" in internal_allowed:
+            allowed_db_types.add("truefalse")
+        if "multichoice" in internal_allowed:
+            allowed_db_types.add("multichoice")
+        if "matching" in internal_allowed:
+            allowed_db_types.add("matching")
+        if "shortanswer" in internal_allowed:
+            allowed_db_types.add("shortanswer")
+        if "essay" in internal_allowed:
+            allowed_db_types.add("essay")
+        # numerical сейчас отдельного типа в моделях нет — можно трактовать как shortanswer или игнорировать.
+        # if "numerical" in allowed:
+        #     allowed_db_types.add("shortanswer")  # предположим, что числовой ответ — частный случай shortanswer
+
+        if not allowed_db_types:
+            allowed_db_types = {"multichoice", "matching", "truefalse"}
+
+        theme_name: Optional[str] = None
 
         try:
+            if theme_id is not None:
+                theme_name = await self.db.get_theme_name(theme_id)
+
             # 1) s3Index → S3
             s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
             local_files = [self.s3.download_to_materials(k) for k in s3_keys]
@@ -454,27 +563,56 @@ class TaskProcessor:
             if not note_text.strip():
                 raise RuntimeError("Нет текстового содержимого для генерации квиза")
 
+            ui_counts = _distribute_question_counts(
+                total=question_count,
+                ui_types=raw_qtypes,
+            )
+
+            internal_allowed: set[QuestionType] = set()
+            for ui_type, cnt in ui_counts.items():
+                if cnt <= 0:
+                    continue
+                internal = UI_TO_INTERNAL.get(ui_type)
+                if internal:
+                    internal_allowed.add(internal)
+
+            if not internal_allowed:
+                internal_allowed = {"multiple_choice"}
+
+            num_true_false = ui_counts.get("truefalse", 0)
+            num_multichoice = ui_counts.get("multichoice", 0)
+            num_matching = ui_counts.get("matching", 0)
+            num_shortanswer = ui_counts.get("shortanswer", 0)
+            num_essay = ui_counts.get("essay", 0)
+
             # 3) генерируем Quiz
             cfg = QuizGenerationConfig(
                 language="Русский",
-                generate_true_false=True,
-                num_true_false=max(1, question_count // 5),
-                generate_multiple_choice=True,
-                num_multiple_choice=max(1, question_count // 2),
+
+                generate_true_false="truefalse" in internal_allowed,
+                num_true_false=max(2, question_count // 5) if "truefalse" in internal_allowed else 0,
+
+                generate_multiple_choice="multichoice" in internal_allowed,
+                num_multiple_choice=max(2, question_count // 2) if "multichoice" in internal_allowed else 0,
+
                 generate_select_all_that_apply=False,
                 num_select_all_that_apply=0,
+
                 generate_fill_in_the_blank=False,
                 num_fill_in_the_blank=0,
-                generate_matching=True,
-                num_matching=max(1, question_count // 5),
-                generate_short_answer=True,
-                num_short_answer=1,
-                generate_long_answer=True,
-                num_long_answer=1,
+
+                generate_matching="matching" in internal_allowed,
+                num_matching=max(2, question_count // 5) if "matching" in internal_allowed else 0,
+
+                generate_short_answer="shortanswer" in internal_allowed,
+                num_short_answer=max(1, question_count // 5) if "shortanswer" in internal_allowed else 0,
+
+                generate_long_answer="essay" in internal_allowed,
+                num_long_answer=max(1, question_count // 5) if "essay" in internal_allowed else 0,
             )
 
-            raw_questions = await generate_quiz_from_text(note_text, cfg)
-            quiz_questions = self._convert_raw_to_quiz_questions(raw_questions)
+            raw_questions = await generate_quiz_from_text(note_text, cfg, theme_name=theme_name)
+            quiz_questions = self._convert_raw_to_quiz_questions(raw_questions, allowed_types=internal_allowed)
 
             # 4) пояснения
             await self._generate_explanations_for_quiz(
@@ -486,9 +624,10 @@ class TaskProcessor:
             # 5) сохранение в Postgres
             await self._persist_quiz(
                 quiz_id=quiz_id,
-                theme_id=themeId,
+                theme_id=theme_id,
                 questions=quiz_questions,
                 file_ids=file_ids,
+                theme_name=theme_name,
             )
 
             # 6) ответ
