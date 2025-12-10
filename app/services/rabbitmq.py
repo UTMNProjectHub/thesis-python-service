@@ -35,8 +35,8 @@ class RabbitClient:
             port=port,
             virtual_host=vhost,
             credentials=credentials,
-            heartbeat=60,
-            blocked_connection_timeout=60,
+            heartbeat=600,
+            blocked_connection_timeout=None,
         )
 
         # Названия очередей
