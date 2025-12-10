@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from .config import QuizGenerationConfig
 
@@ -70,12 +70,19 @@ def build_requirements(cfg: QuizGenerationConfig) -> str:
     return "\n".join(parts)
 
 
-def build_user_prompt(cfg: QuizGenerationConfig) -> str:
+def build_user_prompt(cfg: QuizGenerationConfig, theme_name: Optional[str] = None) -> str:
     """
     Финальный user-prompt, который мы отправляем в LLM вместе с текстом конспекта.
     Здесь описываем формат JSON и правила для поля answer.
     """
     requirements = build_requirements(cfg)
+
+    theme_block = ""
+    if theme_name:
+        theme_block = (
+            f"Тема квиза: «{theme_name}».\n"
+            f"Все вопросы должны относиться именно к этой теме и опираться на предоставленный учебный текст.\n\n"
+        )
 
     format_description = """
 Используй следующий JSON-формат:
@@ -118,7 +125,7 @@ def build_user_prompt(cfg: QuizGenerationConfig) -> str:
 
     return f"""
 Выше приведён учебный текст (конспект).
-По этому тексту сгенерируй экзаменационные вопросы.
+{theme_block} По этому тексту сгенерируй экзаменационные вопросы.
 
 Требования к количеству и типам вопросов:
 {requirements}

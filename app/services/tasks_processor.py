@@ -589,11 +589,11 @@ class TaskProcessor:
             cfg = QuizGenerationConfig(
                 language="Русский",
 
-                generate_true_false="truefalse" in internal_allowed,
-                num_true_false=max(2, question_count // 5) if "truefalse" in internal_allowed else 0,
+                generate_true_false=num_true_false > 0,
+                num_true_false=num_true_false,
 
-                generate_multiple_choice="multichoice" in internal_allowed,
-                num_multiple_choice=max(2, question_count // 2) if "multichoice" in internal_allowed else 0,
+                generate_multiple_choice=num_multichoice > 0,
+                num_multiple_choice=num_multichoice,
 
                 generate_select_all_that_apply=False,
                 num_select_all_that_apply=0,
@@ -601,14 +601,14 @@ class TaskProcessor:
                 generate_fill_in_the_blank=False,
                 num_fill_in_the_blank=0,
 
-                generate_matching="matching" in internal_allowed,
-                num_matching=max(2, question_count // 5) if "matching" in internal_allowed else 0,
+                generate_matching=num_matching > 0,
+                num_matching=num_matching,
 
-                generate_short_answer="shortanswer" in internal_allowed,
-                num_short_answer=max(1, question_count // 5) if "shortanswer" in internal_allowed else 0,
+                generate_short_answer=num_shortanswer > 0,
+                num_short_answer=num_shortanswer,
 
-                generate_long_answer="essay" in internal_allowed,
-                num_long_answer=max(1, question_count // 5) if "essay" in internal_allowed else 0,
+                generate_long_answer=num_essay > 0,
+                num_long_answer=num_essay,
             )
 
             raw_questions = await generate_quiz_from_text(note_text, cfg, theme_name=theme_name)

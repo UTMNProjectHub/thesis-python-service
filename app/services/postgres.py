@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 from uuid import UUID
+import json
 
 import asyncpg
 
@@ -149,6 +150,12 @@ class PostgresClient:
             matching_config: Optional[dict],
     ) -> None:
         pool = await self.connect()
+
+        if matching_config is not None and not isinstance(matching_config, str):
+            matching_config_db = json.dumps(matching_config, ensure_ascii=False)
+        else:
+            matching_config_db = matching_config
+
         await pool.execute(
             """
             INSERT INTO thesis.questions_variants(
@@ -160,7 +167,7 @@ class PostgresClient:
             question_id,
             variant_id,
             is_right,
-            matching_config,
+            matching_config_db,
         )
 
     async def link_question_to_quiz(
@@ -179,6 +186,21 @@ class PostgresClient:
             quiz_id,
             question_id,
         )
+
+    async def get_theme_name(self, theme_id: int) -> Optional[str]:
+        """
+        Возвращает name из thesis.themes по id.
+        """
+        pool = await self.connect()
+        row = await pool.fetchrow(
+            """
+            SELECT name
+            FROM thesis.themes
+            WHERE id = $1
+            """,
+            theme_id,
+        )
+        return row["name"] if row else None
 
     async def insert_reference_question(
             self,

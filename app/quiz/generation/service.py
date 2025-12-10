@@ -12,6 +12,7 @@ from .llm_parser import parse_questions_from_json
 async def generate_quiz_from_text(
         note_text: str,
         cfg: Optional[QuizGenerationConfig] = None,
+        theme_name: Optional[str] = None,
 ) -> List[QuizQuestion]:
     """
     Главная функция генерации квиза.
@@ -22,7 +23,7 @@ async def generate_quiz_from_text(
     if cfg is None:
         cfg = QuizGenerationConfig()
 
-    user_prompt = build_user_prompt(cfg)
+    user_prompt = build_user_prompt(cfg, theme_name=theme_name)
 
     # Твой proxy_client: text = исходный конспект, user_prompt = инструкция по генерации
     raw_answer, _ = await proxy_completion(
