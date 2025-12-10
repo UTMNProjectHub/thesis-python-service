@@ -337,6 +337,10 @@ class TaskProcessor:
         additional_req = payload.get("additional_requirements") or ""
 
         try:
+            theme = await self.db.get_theme_name(theme_id)
+            theme_name: str = str(theme)
+
+            summary_file_id = uuid4()
             # 1) s3Index из БД
             s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
 
@@ -357,9 +361,9 @@ class TaskProcessor:
             retriever.index(chunks)
 
             topic = LectureTopic(
-                id=f"summary_{summary_id}",
-                title=f"Авто-конспект по теме {theme_id}",
-                description=f"Автоматически сгенерированный конспект. {additional_req}",
+                id=str(summary_file_id),
+                title=f"Авто-конспект по теме {theme_name}",
+                description=f"Автоматически сгенерированный конспект.",
                 difficulty=DifficultyLevel.MEDIUM,
                 keywords=[],
                 duration_min=90,
@@ -387,71 +391,23 @@ class TaskProcessor:
             summary_path = Path("files_materials") / f"summary_{summary_id}.md"
             summary_path.write_text(lecture_md, encoding="utf-8")
 
-            # 4) сохраняем summary в Postgres
+            # s3_key = f"quizy/summaries/{summary_file_id}.md"
+            file_name = f"Авто-конспект по теме {theme_name}.md"
+
+            s3_key = self.s3.upload_file_to_bucket(
+                local_path=str(summary_path),
+                original_name=file_name,
+                bucket='quizy/summaries/',
+                user_id=None,
+            )
+
             await self.db.save_summary_text(
-                summary_id=summary_id,
+                summary_id=summary_file_id,
                 theme_id=theme_id,
-                markdown=lecture_md,
+                s3_key=s3_key,
+                file_name=file_name,
+                user_id=None,
             )
-
-            # 5) генерируем Quiz на основе lecture_md (как main_generate_quiz.py)
-            cfg = QuizGenerationConfig(
-                language="Русский",
-                generate_true_false=True,
-                num_true_false=2,
-                generate_multiple_choice=True,
-                num_multiple_choice=3,
-                generate_select_all_that_apply=True,
-                num_select_all_that_apply=2,
-                generate_fill_in_the_blank=True,
-                num_fill_in_the_blank=2,
-                generate_matching=True,
-                num_matching=1,
-                generate_short_answer=True,
-                num_short_answer=2,
-                generate_long_answer=True,
-                num_long_answer=1,
-            )
-
-            raw_questions = await generate_quiz_from_text(lecture_md, cfg)
-            quiz_questions = self._convert_raw_to_quiz_questions(raw_questions)
-
-            # 6) пояснения (explainer)
-            await self._generate_explanations_for_quiz(
-                lecture_md=lecture_md,
-                questions=quiz_questions,
-                difficulty="medium",
-            )
-
-            # 7) сохраняем Quiz в Postgres (используем summaryId как quizId или отдельный)
-            quiz_id = summary_id  # можно сделать отдельный uuid4() если нужно
-            await self._persist_quiz(
-                quiz_id=quiz_id,
-                theme_id=theme_id,
-                questions=quiz_questions,
-                file_ids=file_ids,
-            )
-
-            # 8) генерируем FAQ на базе того же markdown (как generate_faq.py)
-            faq_cfg = FAQGenerationConfig(
-                language="ru",
-                num_questions=10,
-                detail_level="medium",
-            )
-
-            faq = await generate_faq_from_file(
-                file_path=str(summary_path),
-                title=f"FAQ по теме {theme_id}",
-                cfg=faq_cfg,
-            )
-
-            for item in faq.items:
-                await self.db.insert_faq_item(
-                    faq_id=uuid4(),
-                    question=item.question,
-                    answer=item.answer,
-                    category=item.category,
-                )
 
             # 9) отправляем SummaryGenComplete
             self.rabbit.publish(
