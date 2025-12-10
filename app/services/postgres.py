@@ -244,6 +244,94 @@ class PostgresClient:
         )
         # answer/category можно хранить в отдельной таблице — сейчас опускаем
 
+        # ------------------------------------------------------------------
+    # SUMMARY
+    # ------------------------------------------------------------------
+    async def save_summary_text(
+            self,
+            summary_id: UUID,          # это будет id в thesis.files.id
+            theme_id: int,
+            s3_key: str,               # ключ в S3 (s3Index)
+            file_name: str,            # читаемое имя файла
+            user_id: Optional[UUID] = None,
+    ) -> int:
+        """
+        Сохранение метаданных конспекта.
+
+        Делает три вещи:
+
+        1) thesis.files:
+           - id        = summary_id (uuid)
+           - name      = file_name
+           - s3Index   = s3_key
+           - userId    = user_id
+
+        2) thesis.summaries:
+           - subjectId = берём из thesis.themes.subjectId (если есть)
+           - themeId   = theme_id
+           - fileId    = summary_id
+
+        3) thesis.references_summary:
+           - summaryId = id из thesis.summaries
+           - fileId    = summary_id
+
+        Возвращает integer id из thesis.summaries.
+        """
+        pool = await self.connect()
+
+        # 1. создаём/обновляем запись в thesis.files
+        await pool.execute(
+            """
+            INSERT INTO thesis.files(id, name, "s3Index", "userId")
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE
+            SET name    = EXCLUDED.name,
+                "s3Index" = EXCLUDED."s3Index",
+                "userId"  = EXCLUDED."userId"
+            """,
+            summary_id,
+            file_name,
+            s3_key,
+            user_id,
+        )
+
+        # 2. вытаскиваем subjectId из thesis.themes (он nullable)
+        row = await pool.fetchrow(
+            """
+            SELECT "subjectId"
+            FROM thesis.themes
+            WHERE id = $1
+            """,
+            theme_id,
+        )
+        subject_id = row["subjectId"] if row else None
+
+        # 3. создаём запись в thesis.summaries
+        summary_row = await pool.fetchrow(
+            """
+            INSERT INTO thesis.summaries("subjectId", "themeId", "fileId")
+            VALUES ($1, $2, $3)
+            RETURNING id
+            """,
+            subject_id,
+            theme_id,
+            summary_id,
+        )
+        summary_db_id: int = summary_row["id"]
+
+        # 4. создаём связь в thesis.references_summary
+        await pool.execute(
+            """
+            INSERT INTO thesis.references_summary("summaryId", "fileId")
+            VALUES ($1, $2)
+            """,
+            summary_db_id,
+            summary_id,
+        )
+
+        return summary_db_id
+
+
 
 def get_postgres_client() -> PostgresClient:
     return PostgresClient()
