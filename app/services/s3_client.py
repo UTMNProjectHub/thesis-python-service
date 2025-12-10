@@ -137,6 +137,7 @@ class S3Client:
     def upload_file_to_bucket(
             self,
             local_path: str,
+            bucket:str,
             original_name: Optional[str] = None,
             user_id: Optional[str] = None,
     ) -> str:
@@ -156,9 +157,15 @@ class S3Client:
         file_id = str(uuid.uuid4())
 
         if user_id:
-            object_name = f"{user_id}/{file_id}_{safe_name}"
+            if bucket:
+                object_name = f"{bucket}/{file_id}_{safe_name}"
+            else:
+                object_name = f"{user_id}/{file_id}_{safe_name}"
         else:
-            object_name = f"{file_id}_{safe_name}"
+            if bucket:
+                object_name = f"{bucket}_{safe_name}"
+            else:
+                object_name = f"{file_id}_{safe_name}"
 
         file_hash = self.compute_file_hash(local_path)
 
