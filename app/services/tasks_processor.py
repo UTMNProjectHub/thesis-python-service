@@ -410,9 +410,9 @@ class TaskProcessor:
             )
 
             # 9) отправляем SummaryGenComplete
-            self.rabbit.publish(
-                queue=self.rabbit.queue_summary_gen_complete,
-                payload={
+            await self.rabbit.publish(
+                self.rabbit.queue_summary_gen_complete,
+                {
                     "summaryId": str(summary_id),
                     "subjectId": subject_id,
                     "themeId": theme_id,
@@ -423,9 +423,9 @@ class TaskProcessor:
 
 
         except Exception as e:
-            self.rabbit.publish(
-                queue=self.rabbit.queue_summary_gen_complete,
-                payload={
+            await self.rabbit.publish(
+                self.rabbit.queue_summary_gen_complete,
+                {
                     "summaryId": str(summary_id),
                     "subjectId": subject_id,
                     "themeId": theme_id,
@@ -587,9 +587,9 @@ class TaskProcessor:
             )
 
             # 6) ответ
-            self.rabbit.publish(
-                queue=self.rabbit.queue_quiz_gen_complete,
-                payload={
+            await self.rabbit.publish(
+                self.rabbit.queue_quiz_gen_complete,
+                {
                     "quizId": str(quiz_id),
                     "status": "SUCCESS",
                     "error": "",
@@ -598,9 +598,9 @@ class TaskProcessor:
 
 
         except Exception as e:
-            self.rabbit.publish(
-                queue=self.rabbit.queue_quiz_gen_complete,
-                payload={
+            await self.rabbit.publish(
+                self.rabbit.queue_quiz_gen_complete,
+                {
                     "quizId": str(quiz_id),
                     "status": "FAILED",
                     "error": str(e),
