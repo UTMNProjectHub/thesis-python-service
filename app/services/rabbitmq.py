@@ -9,6 +9,7 @@ import pika
 from urllib.parse import urlparse
 
 from app.api.core.config import settings
+import asyncio
 
 
 class RabbitClient:
@@ -118,7 +119,12 @@ class RabbitClient:
             def _on_message(ch, method, properties, body):
                 try:
                     data = json.loads(body.decode("utf-8"))
-                    callback(data)
+
+                    result = callback(data)
+                    if asyncio.iscoroutine(result):
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(result)
+
                 except Exception as e:
                     print(f"[Rabbit] Ошибка обработки сообщения: {e}")
                 finally:

@@ -163,7 +163,7 @@ class S3Client:
                 object_name = f"{user_id}/{file_id}_{safe_name}"
         else:
             if bucket:
-                object_name = f"{bucket}_{safe_name}"
+                object_name = f"{bucket}{file_id}_{safe_name}"
             else:
                 object_name = f"{file_id}_{safe_name}"
 

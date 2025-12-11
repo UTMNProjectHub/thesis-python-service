@@ -19,6 +19,9 @@ from app.documents.indexers import HybridRetriever
 from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.lectures import build_lecture_plan_for_topic, generate_lecture_markdown
 
+from app.utils.md_to_pdf import markdown_to_pdf
+
+
 # FAQ
 from app.faq.config import FAQGenerationConfig
 from app.faq.generator import generate_faq_from_file
@@ -391,11 +394,14 @@ class TaskProcessor:
             summary_path = Path("files_materials") / f"summary_{summary_id}.md"
             summary_path.write_text(lecture_md, encoding="utf-8")
 
+            pdf_path = Path("files_materials") / f"summary_{summary_id}.pdf"
+            markdown_to_pdf(summary_path, pdf_path)
+
             # s3_key = f"quizy/summaries/{summary_file_id}.md"
-            file_name = f"Авто-конспект по теме {theme_name}.md"
+            file_name = f"auto conspect on theme.pdf"
 
             s3_key = self.s3.upload_file_to_bucket(
-                local_path=str(summary_path),
+                local_path=str(pdf_path),
                 original_name=file_name,
                 bucket='summaries/',
                 user_id=None,
