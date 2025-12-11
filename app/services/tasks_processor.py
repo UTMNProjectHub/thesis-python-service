@@ -397,7 +397,7 @@ class TaskProcessor:
             s3_key = self.s3.upload_file_to_bucket(
                 local_path=str(summary_path),
                 original_name=file_name,
-                bucket='quizy/summaries/',
+                bucket='summaries/',
                 user_id=None,
             )
 
