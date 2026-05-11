@@ -1,35 +1,21 @@
-# app/services/tasks_processor.py
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
+import random
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4, UUID
-import random
 
-from app.services.s3_client import S3Client
-from app.services.postgres import PostgresClient
-from app.services.rabbitmq import RabbitClient
-
-# Для SUMMARY (конспект)
-from app.documents.pdf_reader import load_pdf_document
-from app.utils.pdf_utils import extract_text_from_pdf
+from app.api.core.config import settings
+from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.documents.chunking import chunk_document_pages
 from app.documents.indexers import HybridRetriever
-from app.curriculum.models import LectureTopic, DifficultyLevel
+from app.documents.pdf_reader import load_pdf_document
 from app.lectures import build_lecture_plan_for_topic, generate_lecture_markdown
-
-from app.utils.md_to_pdf import markdown_to_pdf
-
-
-# FAQ
-from app.faq.config import FAQGenerationConfig
-from app.faq.generator import generate_faq_from_file
-
-# QUIZ + RAG + EXPLAINER
-from app.quiz.generation import QuizGenerationConfig, generate_quiz_from_text
-from app.quiz.rag import SimpleVectorStore
 from app.quiz.explainer import generate_explanations
+from app.quiz.generation import QuizGenerationConfig, generate_quiz_from_text
 from app.quiz.models import (
     TrueFalseQuestion,
     MultipleChoiceQuestion,
@@ -40,9 +26,17 @@ from app.quiz.models import (
     QuizQuestion,
     AnswerVariant,
     MatchingPair,
-    Question,  # union тип
+    Question,
     QuestionType
 )
+from app.quiz.rag import SimpleVectorStore
+from app.services.postgres import PostgresClient
+from app.services.rabbitmq import RabbitClient
+from app.services.s3_client import S3Client
+from app.utils.md_to_pdf import markdown_to_pdf
+from app.utils.pdf_utils import extract_text_from_pdf
+
+logger = logging.getLogger(__name__)
 
 UI_TO_INTERNAL: dict[str, QuestionType] = {
     "truefalse": "true_false",
@@ -50,12 +44,14 @@ UI_TO_INTERNAL: dict[str, QuestionType] = {
     "matching": "matching",
     "shortanswer": "short_answer",
     "essay": "long_answer",
-    "numerical": "fill_in_the_blank",  # либо отдельная логика, если понадобится
+    "numerical": "fill_in_the_blank",
 }
 
 INTERNAL_TO_DB: dict[QuestionType, str] = {
     "true_false": "truefalse",
     "multiple_choice": "multichoice",
+    "select_all_that_apply": "multichoice",
+    "fill_in_the_blank": "shortanswer",
     "matching": "matching",
     "short_answer": "shortanswer",
     "long_answer": "essay",
@@ -74,10 +70,8 @@ def _distribute_question_counts(
     - если total >= len(types) -> каждому минимум 1, остальное раскидывается случайно;
     - если total < len(types)  -> ровно total типов получают по 1 вопросу.
     """
-    # отфильтровали numerical
-    types = [t for t in ui_types if t != "numerical"]
+    types = [t for t in ui_types if t in UI_TO_INTERNAL]
 
-    # если после фильтра ничего не осталось — дефолтный тип
     if not types:
         types = ["multichoice"]
 
@@ -85,28 +79,39 @@ def _distribute_question_counts(
     if total <= 0:
         return {t: 0 for t in types}
 
-    # total >= n — каждому минимум по одному, плюс равномерный остаток
     if total >= n:
-        base = total // n          # минимум для каждого типа
-        remainder = total % n      # сколько "лишних" вопросов раскидываем
+        base = total // n
+        remainder = total % n
 
         counts = {t: base for t in types}
 
-        # если базовое распределение дало всем >=1? при total>=n base всегда >=1
-        # остаток распределяем случайно по типам
         if remainder > 0:
             extra_types = random.sample(types, k=remainder)
             for t in extra_types:
                 counts[t] += 1
     else:
-        # total < n — типов больше, чем вопросов.
-        # Выбираем случайные total типов, им даём по 1 вопросу.
         counts = {t: 0 for t in types}
         chosen = random.sample(types, k=total)
         for t in chosen:
             counts[t] = 1
 
     return counts
+
+
+def _sample_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    part = max(max_chars // 3, 1)
+    middle_start = max((len(text) - part) // 2, 0)
+    return "\n\n".join(
+        [
+            text[:part],
+            text[middle_start:middle_start + part],
+            text[-part:],
+        ]
+    )
+
 
 class TaskProcessor:
     """
@@ -131,14 +136,50 @@ class TaskProcessor:
         self.s3 = s3
         self.db = db
 
-    # ------------------------------------------------------------------
-    # ВСПОМОГАТЕЛЬНОЕ: конвертация raw_questions → QuizQuestion
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _work_dir(kind: str, task_id: UUID) -> Path:
+        path = Path("files_materials") / kind / str(task_id)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    async def _download_s3_keys(
+            self,
+            s3_keys: List[str],
+            work_dir: Path,
+            task_kind: str,
+            task_id: UUID,
+    ) -> List[str]:
+        local_files: List[str] = []
+        for index, key in enumerate(s3_keys, start=1):
+            logger.info(
+                "%s downloading source file taskId=%s index=%d total=%d key=%s work_dir=%s",
+                task_kind,
+                task_id,
+                index,
+                len(s3_keys),
+                key,
+                work_dir,
+            )
+            local_file = await asyncio.to_thread(self.s3.download_to_materials, key, work_dir)
+            local_files.append(local_file)
+        return local_files
+
+    async def _publish(self, queue: str, payload: dict) -> None:
+        logger.info("Publishing task result queue=%s payload=%s", queue, payload)
+        result = self.rabbit.publish(queue, payload)
+        if inspect.isawaitable(result):
+            await result
+
     def _convert_raw_to_quiz_questions(
             self, raw_questions: List[Question],
             allowed_types: Optional[set[QuestionType]] = None,
     ) -> List[QuizQuestion]:
         questions: List[QuizQuestion] = []
+        logger.info(
+            "Converting generated questions raw_count=%d allowed_types=%s",
+            len(raw_questions),
+            sorted(allowed_types) if allowed_types else None,
+        )
 
         for q in raw_questions:
             q_type: QuestionType
@@ -155,6 +196,14 @@ class TaskProcessor:
                 correct_answer = "True" if q.answer else "False"
 
             elif isinstance(q, MultipleChoiceQuestion):
+                if q.answer < 0 or q.answer >= len(q.options):
+                    logger.warning(
+                        "Skipping multiple choice question with invalid answer index answer=%s options=%d question=%s",
+                        q.answer,
+                        len(q.options),
+                        q.question[:120],
+                    )
+                    continue
                 q_type = "multiple_choice"
                 variants = [
                     AnswerVariant(
@@ -168,21 +217,20 @@ class TaskProcessor:
                 correct_answer = q.options[q.answer]
 
             elif isinstance(q, SelectAllThatApplyQuestion):
-                continue
                 q_type = "select_all_that_apply"
+                correct_indices = {idx for idx in q.answer if 0 <= idx < len(q.options)}
                 variants = [
                     AnswerVariant(
                         id=chr(65 + i),
                         text=opt,
-                        is_correct=(i in q.answer),
+                        is_correct=(i in correct_indices),
                         explanation="",
                     )
                     for i, opt in enumerate(q.options)
                 ]
-                correct_answer = [q.options[i] for i in q.answer]
+                correct_answer = [q.options[i] for i in sorted(correct_indices)]
 
             elif isinstance(q, FillInTheBlankQuestion):
-                continue
                 q_type = "fill_in_the_blank"
                 correct_answer = q.answer
 
@@ -199,28 +247,34 @@ class TaskProcessor:
                 correct_answer = q.answer
 
             else:
+                logger.warning("Skipping unsupported generated question class=%s", type(q).__name__)
                 # неизвестный тип — пропускаем
                 continue
 
             if allowed_types is not None and q_type not in allowed_types:
+                logger.info("Skipping generated question by type filter type=%s question=%s", q_type, q.question[:120])
                 continue
 
             qq = QuizQuestion(
                 id=uuid4(),
                 text=q.question,
-                type=q_type,  # QuestionType у вас Literal[…]
+                type=q_type,
                 variants=variants,
                 correct_answer=correct_answer,
                 matching_pairs=matching_pairs,
                 general_explanation="",
             )
             questions.append(qq)
+            logger.info(
+                "Converted generated question type=%s variants=%d matching_pairs=%d",
+                q_type,
+                len(variants or []),
+                len(matching_pairs or []),
+            )
 
+        logger.info("Generated questions converted count=%d", len(questions))
         return questions
 
-    # ------------------------------------------------------------------
-    # ВСПОМОГАТЕЛЬНОЕ: генерация пояснений (explainer) по lecture_md
-    # ------------------------------------------------------------------
     async def _generate_explanations_for_quiz(
             self,
             lecture_md: str,
@@ -229,14 +283,19 @@ class TaskProcessor:
     ) -> None:
         rag_store = SimpleVectorStore()
         await rag_store.add_document(lecture_md)
+        logger.info(
+            "Generating explanations questions=%d difficulty=%s source_chars=%d",
+            len(questions),
+            difficulty,
+            len(lecture_md),
+        )
 
         for q in questions:
             chunks = await rag_store.search(q.text, top_k=6)
+            logger.info("Generating explanation questionId=%s type=%s chunks=%d", q.id, q.type, len(chunks))
             await generate_explanations(q, chunks, difficulty=difficulty)
+        logger.info("Explanations generated questions=%d", len(questions))
 
-    # ------------------------------------------------------------------
-    # ВСПОМОГАТЕЛЬНОЕ: сохранение квиза в Postgres
-    # ------------------------------------------------------------------
     async def _persist_quiz(
             self,
             quiz_id: UUID,
@@ -245,8 +304,14 @@ class TaskProcessor:
             file_ids: List[UUID],
             theme_name: Optional[str] = None,
     ) -> None:
-        # метаданные квиза
         quiz_name = f"Авто-квиз по теме «{theme_name}»" if theme_name else "Авто-квиз"
+        logger.info(
+            "Persisting quiz metadata quizId=%s themeId=%s questions=%d files=%d",
+            quiz_id,
+            theme_id,
+            len(questions),
+            len(file_ids),
+        )
         await self.db.save_quiz_metadata(
             quiz_id=quiz_id,
             theme_id=theme_id,
@@ -259,6 +324,13 @@ class TaskProcessor:
 
             db_qtype = INTERNAL_TO_DB[q.type]
             multi_answer = q.type in ("select_all_that_apply", "matching")
+            logger.info(
+                "Persisting question quizId=%s questionId=%s type=%s db_type=%s",
+                quiz_id,
+                q_db_id,
+                q.type,
+                db_qtype,
+            )
 
             await self.db.insert_question(
                 question_id=q_db_id,
@@ -267,7 +339,6 @@ class TaskProcessor:
                 multi_answer=multi_answer,
             )
 
-            # ссылки вопрос ↔ файл(ы)
             for f_id in file_ids:
                 await self.db.insert_reference_question(
                     ref_id=uuid4(),
@@ -275,27 +346,32 @@ class TaskProcessor:
                     file_id=f_id,
                 )
 
-            # варианты
             if q.type == "matching" and q.matching_pairs:
-                # В matching складываем пары в matchingConfig,
-                # variantId оставляем NULL.
-                matching_config = {
-                    "pairs": [
-                        {"left": p.left_option, "right": p.right_option}
-                        for p in q.matching_pairs
-                    ]
-                }
-                await self.db.insert_question_variant_link(
-                    link_id=uuid4(),
-                    question_id=q_db_id,
-                    variant_id=None,
-                    is_right=True,
-                    matching_config=matching_config,
+                logger.info(
+                    "Persisting matching pairs questionId=%s pairs=%d",
+                    q_db_id,
+                    len(q.matching_pairs),
                 )
+                for pair in q.matching_pairs:
+                    v_db_id = uuid4()
+                    await self.db.insert_variant(
+                        variant_id=v_db_id,
+                        text=f"{pair.left_option} -> {pair.right_option}",
+                        explain_right="Верно",
+                        explain_wrong="Неверно",
+                        left_matching=pair.left_option,
+                        right_matching=pair.right_option,
+                    )
+                    await self.db.insert_question_variant_link(
+                        link_id=uuid4(),
+                        question_id=q_db_id,
+                        variant_id=v_db_id,
+                        is_right=True,
+                    )
             elif q.variants:
+                logger.info("Persisting variants questionId=%s variants=%d", q_db_id, len(q.variants))
                 for v in q.variants:
                     v_db_id = uuid4()
-                    # простая логика: пояснение для правильного → explainRight, для неверного → explainWrong
                     explain_right = v.explanation if v.is_correct else ""
                     explain_wrong = v.explanation if not v.is_correct else ""
                     await self.db.insert_variant(
@@ -309,19 +385,15 @@ class TaskProcessor:
                         question_id=q_db_id,
                         variant_id=v_db_id,
                         is_right=v.is_correct,
-                        matching_config=None,
                     )
 
-            # связь вопрос–квиз
             await self.db.link_question_to_quiz(
                 link_id=uuid4(),
                 quiz_id=quiz_id,
                 question_id=q_db_id,
             )
+        logger.info("Quiz persisted quizId=%s", quiz_id)
 
-    # ------------------------------------------------------------------
-    # SUMMARY GEN
-    # ------------------------------------------------------------------
     async def handle_summary_gen(self, payload: dict) -> None:
         """
         SummaryGen:
@@ -338,30 +410,57 @@ class TaskProcessor:
         theme_id = payload["themeId"]
         file_ids = [UUID(fid) for fid in payload["files"]]
         additional_req = payload.get("additional_requirements") or ""
+        logger.info(
+            "SummaryGen started summaryId=%s subjectId=%s themeId=%s files=%d additional_requirements_len=%d",
+            summary_id,
+            subject_id,
+            theme_id,
+            len(file_ids),
+            len(additional_req),
+        )
 
+        s3_keys: List[str] = []
         try:
+            work_dir = self._work_dir("summary", summary_id)
+            logger.info("SummaryGen work dir prepared summaryId=%s path=%s", summary_id, work_dir)
+
             theme = await self.db.get_theme_name(theme_id)
             theme_name: str = str(theme)
+            logger.info("SummaryGen theme resolved summaryId=%s theme=%s", summary_id, theme_name)
 
             summary_file_id = uuid4()
             # 1) s3Index из БД
             s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
+            logger.info("SummaryGen S3 keys loaded summaryId=%s count=%d", summary_id, len(s3_keys))
+            if len(s3_keys) != len(file_ids):
+                logger.warning(
+                    "SummaryGen S3 key count mismatch summaryId=%s requested_files=%d found_keys=%d",
+                    summary_id,
+                    len(file_ids),
+                    len(s3_keys),
+                )
 
-            # 2) скачиваем файлы из S3 → files_materials
-            local_files = [self.s3.download_to_materials(k) for k in s3_keys]
+            local_files = await self._download_s3_keys(s3_keys, work_dir, "SummaryGen", summary_id)
+            logger.info("SummaryGen files downloaded summaryId=%s count=%d", summary_id, len(local_files))
 
-            # выбираем первый PDF для генерации конспекта
             pdf_files = [Path(f) for f in local_files if f and f.lower().endswith(".pdf")]
             if not pdf_files:
                 raise RuntimeError("Не найден PDF-файл среди materials для SummaryGen")
 
             pdf_path = pdf_files[0]
+            logger.info("SummaryGen selected PDF summaryId=%s path=%s", summary_id, pdf_path)
 
-            # 3) строим конспект (lecture_md) — логика как в main_lecture_full_test.py
-            doc, pages = load_pdf_document(str(pdf_path))
-            chunks = chunk_document_pages(doc, pages, max_tokens=700)
+            doc, pages = await asyncio.to_thread(load_pdf_document, str(pdf_path))
+            chunks = await asyncio.to_thread(chunk_document_pages, doc, pages, max_tokens=700)
+            logger.info(
+                "SummaryGen PDF parsed summaryId=%s document=%s pages=%d chunks=%d",
+                summary_id,
+                doc.id,
+                doc.pages,
+                len(chunks),
+            )
             retriever = HybridRetriever(alpha=0.7)
-            retriever.index(chunks)
+            await asyncio.to_thread(retriever.index, chunks)
 
             topic = LectureTopic(
                 id=str(summary_file_id),
@@ -381,6 +480,11 @@ class TaskProcessor:
                 min_sections=3,
                 max_sections=7,
             )
+            logger.info(
+                "SummaryGen lecture plan built summaryId=%s sections=%d",
+                summary_id,
+                len(plan.sections),
+            )
 
             lecture_md = await generate_lecture_markdown(
                 plan=plan,
@@ -389,18 +493,19 @@ class TaskProcessor:
                 max_tokens_per_section=1500,
                 top_k_chunks_per_section=5,
             )
+            logger.info("SummaryGen lecture markdown generated summaryId=%s chars=%d", summary_id, len(lecture_md))
 
-            # сохраняем md на диск (чтобы re-use для FAQ)
-            summary_path = Path("files_materials") / f"summary_{summary_id}.md"
-            summary_path.write_text(lecture_md, encoding="utf-8")
+            summary_path = work_dir / f"summary_{summary_id}.md"
+            await asyncio.to_thread(summary_path.write_text, lecture_md, encoding="utf-8")
 
-            pdf_path = Path("files_materials") / f"summary_{summary_id}.pdf"
-            markdown_to_pdf(summary_path, pdf_path)
+            pdf_path = work_dir / f"summary_{summary_id}.pdf"
+            await asyncio.to_thread(markdown_to_pdf, summary_path, pdf_path)
+            logger.info("SummaryGen PDF exported summaryId=%s path=%s", summary_id, pdf_path)
 
-            # s3_key = f"quizy/summaries/{summary_file_id}.md"
             file_name = f"auto conspect on theme.pdf"
 
-            s3_key = self.s3.upload_file_to_bucket(
+            s3_key = await asyncio.to_thread(
+                self.s3.upload_file_to_bucket,
                 local_path=str(pdf_path),
                 original_name=file_name,
                 bucket='summaries/',
@@ -414,9 +519,10 @@ class TaskProcessor:
                 file_name=file_name,
                 user_id=None,
             )
+            logger.info("SummaryGen metadata saved summaryId=%s fileId=%s s3_key=%s", summary_id, summary_file_id,
+                        s3_key)
 
-            # 9) отправляем SummaryGenComplete
-            await self.rabbit.publish(
+            await self._publish(
                 self.rabbit.queue_summary_gen_complete,
                 {
                     "summaryId": str(summary_id),
@@ -426,10 +532,12 @@ class TaskProcessor:
                     "error": "",
                 },
             )
+            logger.info("SummaryGen completed summaryId=%s status=SUCCESS", summary_id)
 
 
         except Exception as e:
-            await self.rabbit.publish(
+            logger.exception("SummaryGen failed summaryId=%s error=%s", summary_id, e)
+            await self._publish(
                 self.rabbit.queue_summary_gen_complete,
                 {
                     "summaryId": str(summary_id),
@@ -439,11 +547,9 @@ class TaskProcessor:
                     "error": str(e),
                 },
             )
+        finally:
+            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)
 
-
-    # ------------------------------------------------------------------
-    # QUIZ GEN (упрощённый — без конспекта)
-    # ------------------------------------------------------------------
     async def handle_quiz_gen(self, payload: dict) -> None:
         """
         QuizGen:
@@ -461,9 +567,20 @@ class TaskProcessor:
         difficulty = payload.get("difficulty", "medium")
         question_count = payload.get("question_count", 10)
         raw_qtypes = payload.get("question_types") or ["multichoice", "matching", "truefalse"]
+        raw_qtypes = [str(t).lower() for t in raw_qtypes]
         additional_req = payload.get("additional_requirements") or ""
         theme_id_raw = payload.get("themeId")
         theme_id: Optional[int] = int(theme_id_raw) if theme_id_raw is not None else None
+        logger.info(
+            "QuizGen started quizId=%s themeId=%s files=%d difficulty=%s question_count=%s question_types=%s additional_requirements_len=%d",
+            quiz_id,
+            theme_id,
+            len(file_ids),
+            difficulty,
+            question_count,
+            raw_qtypes,
+            len(additional_req),
+        )
 
         internal_allowed: set[QuestionType] = set()
         for t in raw_qtypes:
@@ -474,61 +591,100 @@ class TaskProcessor:
         if not internal_allowed:
             internal_allowed = {"multiple_choice", "matching", "true_false"}
 
-        # Допустимые типы для БД (у вас они: multichoice|essay|matching|truefalse|shortanswer|numerical)
+        # Допустимые типы для БД (multichoice|essay|matching|truefalse|shortanswer|numerical)
         allowed_db_types: set[str] = set()
-        if "truefalse" in internal_allowed:
+        if "true_false" in internal_allowed:
             allowed_db_types.add("truefalse")
-        if "multichoice" in internal_allowed:
+        if "multiple_choice" in internal_allowed or "select_all_that_apply" in internal_allowed:
             allowed_db_types.add("multichoice")
         if "matching" in internal_allowed:
             allowed_db_types.add("matching")
-        if "shortanswer" in internal_allowed:
+        if "short_answer" in internal_allowed or "fill_in_the_blank" in internal_allowed:
             allowed_db_types.add("shortanswer")
-        if "essay" in internal_allowed:
+        if "long_answer" in internal_allowed:
             allowed_db_types.add("essay")
-        # numerical сейчас отдельного типа в моделях нет — можно трактовать как shortanswer или игнорировать.
         # if "numerical" in allowed:
-        #     allowed_db_types.add("shortanswer")  # предположим, что числовой ответ — частный случай shortanswer
+        #     allowed_db_types.add("shortanswer")
 
         if not allowed_db_types:
             allowed_db_types = {"multichoice", "matching", "truefalse"}
 
         theme_name: Optional[str] = None
 
+        s3_keys: List[str] = []
         try:
+            work_dir = self._work_dir("quiz", quiz_id)
+            logger.info("QuizGen work dir prepared quizId=%s path=%s", quiz_id, work_dir)
+
             if theme_id is not None:
                 theme_name = await self.db.get_theme_name(theme_id)
+                logger.info("QuizGen theme resolved quizId=%s theme=%s", quiz_id, theme_name)
 
             # 1) s3Index → S3
             s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
-            local_files = [self.s3.download_to_materials(k) for k in s3_keys]
+            logger.info("QuizGen S3 keys loaded quizId=%s count=%d", quiz_id, len(s3_keys))
+            if len(s3_keys) != len(file_ids):
+                logger.warning(
+                    "QuizGen S3 key count mismatch quizId=%s requested_files=%d found_keys=%d",
+                    quiz_id,
+                    len(file_ids),
+                    len(s3_keys),
+                )
+            local_files = await self._download_s3_keys(s3_keys, work_dir, "QuizGen", quiz_id)
+            logger.info("QuizGen files downloaded quizId=%s count=%d", quiz_id, len(local_files))
 
-            # 2) просто склеиваем тексты файлов в один note_text
             note_text = ""
             for lf in local_files:
                 if not lf:
                     continue
                 p = Path(lf)
                 if p.suffix.lower() in (".md", ".txt"):
-                    note_text += p.read_text(encoding="utf-8") + "\n\n"
+                    file_text = await asyncio.to_thread(p.read_text, encoding="utf-8")
+                    sampled_text = _sample_text(file_text, settings.quiz_source_max_chars_per_file)
+                    note_text += sampled_text + "\n\n"
+                    logger.info(
+                        "QuizGen text file read quizId=%s path=%s chars=%d sampled_chars=%d",
+                        quiz_id,
+                        p,
+                        len(file_text),
+                        len(sampled_text),
+                    )
                 elif p.suffix.lower() == ".pdf":
-                    # читаем текст из PDF
                     try:
-                        pdf_text = extract_text_from_pdf(str(p))
+                        pdf_text = await asyncio.to_thread(extract_text_from_pdf, str(p))
                     except Exception as e:
-                        # при желании можно просто залогировать и continue
+                        logger.exception("QuizGen PDF text extraction failed quizId=%s path=%s error=%s", quiz_id, p, e)
                         raise RuntimeError(f"Не удалось прочитать PDF '{p}': {e}")
 
                     if pdf_text.strip():
-                        note_text += pdf_text + "\n\n"
+                        sampled_text = _sample_text(pdf_text, settings.quiz_source_max_chars_per_file)
+                        note_text += sampled_text + "\n\n"
+                        logger.info(
+                            "QuizGen PDF text extracted quizId=%s path=%s chars=%d sampled_chars=%d",
+                            quiz_id,
+                            p,
+                            len(pdf_text),
+                            len(sampled_text),
+                        )
 
             if not note_text.strip():
                 raise RuntimeError("Нет текстового содержимого для генерации квиза")
+            if len(note_text) > settings.quiz_source_max_chars:
+                original_chars = len(note_text)
+                note_text = _sample_text(note_text, settings.quiz_source_max_chars)
+                logger.info(
+                    "QuizGen source text sampled quizId=%s original_chars=%d sampled_chars=%d",
+                    quiz_id,
+                    original_chars,
+                    len(note_text),
+                )
+            logger.info("QuizGen source text ready quizId=%s chars=%d", quiz_id, len(note_text))
 
             ui_counts = _distribute_question_counts(
                 total=question_count,
                 ui_types=raw_qtypes,
             )
+            logger.info("QuizGen question distribution quizId=%s counts=%s", quiz_id, ui_counts)
 
             internal_allowed: set[QuestionType] = set()
             for ui_type, cnt in ui_counts.items():
@@ -547,7 +703,6 @@ class TaskProcessor:
             num_shortanswer = ui_counts.get("shortanswer", 0)
             num_essay = ui_counts.get("essay", 0)
 
-            # 3) генерируем Quiz
             cfg = QuizGenerationConfig(
                 language="Русский",
 
@@ -574,16 +729,17 @@ class TaskProcessor:
             )
 
             raw_questions = await generate_quiz_from_text(note_text, cfg, theme_name=theme_name)
+            logger.info("QuizGen raw questions generated quizId=%s count=%d", quiz_id, len(raw_questions))
             quiz_questions = self._convert_raw_to_quiz_questions(raw_questions, allowed_types=internal_allowed)
+            logger.info("QuizGen questions converted quizId=%s count=%d", quiz_id, len(quiz_questions))
 
-            # 4) пояснения
             await self._generate_explanations_for_quiz(
                 lecture_md=note_text,
                 questions=quiz_questions,
                 difficulty=difficulty,
             )
+            logger.info("QuizGen explanations generated quizId=%s", quiz_id)
 
-            # 5) сохранение в Postgres
             await self._persist_quiz(
                 quiz_id=quiz_id,
                 theme_id=theme_id,
@@ -591,9 +747,9 @@ class TaskProcessor:
                 file_ids=file_ids,
                 theme_name=theme_name,
             )
+            logger.info("QuizGen persisted quizId=%s questions=%d", quiz_id, len(quiz_questions))
 
-            # 6) ответ
-            await self.rabbit.publish(
+            await self._publish(
                 self.rabbit.queue_quiz_gen_complete,
                 {
                     "quizId": str(quiz_id),
@@ -601,10 +757,12 @@ class TaskProcessor:
                     "error": "",
                 },
             )
+            logger.info("QuizGen completed quizId=%s status=SUCCESS", quiz_id)
 
 
         except Exception as e:
-            await self.rabbit.publish(
+            logger.exception("QuizGen failed quizId=%s error=%s", quiz_id, e)
+            await self._publish(
                 self.rabbit.queue_quiz_gen_complete,
                 {
                     "quizId": str(quiz_id),
@@ -612,4 +770,5 @@ class TaskProcessor:
                     "error": str(e),
                 },
             )
-
+        finally:
+            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)

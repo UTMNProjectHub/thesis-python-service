@@ -21,7 +21,8 @@ def extract_docx_text(path: str | Path) -> str:
     return "\n\n".join(paragraphs).strip()
 
 
-def load_docx_document(path: str | Path, doc_id: str | None = None, title: str | None = None) -> Tuple[Document, List[str]]:
+def load_docx_document(path: str | Path, doc_id: str | None = None, title: str | None = None) -> Tuple[
+    Document, List[str]]:
     """
     Загружает DOCX как Document + список "страниц".
     Пока считаем, что весь текст — одна логическая страница (index 0).
@@ -49,5 +50,4 @@ def load_docx_document(path: str | Path, doc_id: str | None = None, title: str |
         pages=1,
     )
 
-    # Для совместимости с chunking используем "как будто это одна страница"
     return doc, [full_text]

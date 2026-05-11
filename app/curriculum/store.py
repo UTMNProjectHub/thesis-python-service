@@ -6,7 +6,6 @@ from typing import Union
 
 from app.curriculum.models import Curriculum
 
-
 PathLike = Union[str, Path]
 
 

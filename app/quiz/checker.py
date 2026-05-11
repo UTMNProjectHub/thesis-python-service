@@ -1,19 +1,25 @@
 from __future__ import annotations
+
 from typing import List
+
 from app.quiz.models import GeneratedQuiz, UserAnswer, CheckResponse, CheckResponseItem, QuizQuestion
 from app.quiz.rag import SimpleVectorStore
 from app.services.proxy_client import proxy_completion
 
 _DOCUMENT_STORE: dict[str, SimpleVectorStore] = {}
 
+
 async def check_quiz_answers(
         quiz: GeneratedQuiz,
         user_answers: List[UserAnswer],
         source_text: str,
         document_id: str = "default"
-    ) -> CheckResponse:
-    store = _DOCUMENT_STORE.setdefault(document_id, await SimpleVectorStore())
-    if not store.chunks:  # Инициализация, если нужно
+) -> CheckResponse:
+    store = _DOCUMENT_STORE.get(document_id)
+    if store is None:
+        store = SimpleVectorStore()
+        _DOCUMENT_STORE[document_id] = store
+    if not store.chunks:
         await store.add_document(source_text)
 
     results: List[CheckResponseItem] = []
@@ -27,9 +33,9 @@ async def check_quiz_answers(
         correct_option_ids: List[str] = [v.id for v in (q.variants or []) if v.is_correct]
 
         if q.variants:  # С вариантами
-            selected_ids = set(ua.selected_option_ids or [])
+            selected_ids = {str(item) for item in (ua.selected_option_ids or [])}
             correct_set = set(correct_option_ids)
-            is_correct = selected_ids == correct_set if q.type in ["select_all_that_apply", "multiple_choice"] else selected_ids.issubset(correct_set)
+            is_correct = bool(selected_ids) and selected_ids == correct_set
         elif ua.text_answer and q.correct_answer:  # Open-ended
             normalized_user = ua.text_answer.strip().lower()
             normalized_correct = str(q.correct_answer).strip().lower()
@@ -73,6 +79,7 @@ async def check_quiz_answers(
         total_questions=len(quiz.questions)
     )
 
+
 def _build_check_prompt(q: QuizQuestion, ua: UserAnswer, is_correct: bool, context: str) -> str:
     wrong_text = ua.text_answer or ", ".join(ua.selected_option_ids or [])
     return f"""
@@ -83,6 +90,6 @@ def _build_check_prompt(q: QuizQuestion, ua: UserAnswer, is_correct: bool, conte
         
         Контекст: {context}
         
-        { "Похвали и объясни почему верно." if is_correct else "Объясни ошибку, укажи правильный и почему." }
+        {"Похвали и объясни почему верно." if is_correct else "Объясни ошибку, укажи правильный и почему."}
         На русском, 2-4 предложения.
         """

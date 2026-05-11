@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-# === Question type enum ===
+# Question type enum
 QuestionType = Literal[
     "multichoice",
     "single_choice",
@@ -18,21 +18,25 @@ QuestionType = Literal[
     "description",
 ]
 
-# === Request Models ===
+
+# Request Models
 class SolveQuestionParams(BaseModel):
     id: UUID = Field(..., description="ID вопроса (uuid)")
+
 
 class SolveQuestionBody(BaseModel):
     answerIds: Optional[List[UUID]] = None
     answerText: Optional[str] = None
     quizId: UUID
 
-# === Base Models ===
+
+# Base Models
 class QuestionModel(BaseModel):
     id: UUID
-    type: str  # как в TS: просто строка, не строго QuestionType
+    type: str
     multiAnswer: Optional[bool] = None
     text: str
+
 
 class VariantModel(BaseModel):
     id: UUID
@@ -43,14 +47,19 @@ class VariantModel(BaseModel):
     questionId: UUID
     variantId: UUID
     questionsVariantsId: UUID
+    leftMatching: Optional[str] = None
+    rightMatching: Optional[str] = None
+
 
 class MatchingLeftItemModel(BaseModel):
     id: UUID
     text: str
 
+
 class MatchingRightItemModel(BaseModel):
     id: UUID
     text: str
+
 
 class MatchingCorrectPairModel(BaseModel):
     leftVariantId: UUID
@@ -58,10 +67,12 @@ class MatchingCorrectPairModel(BaseModel):
     explainRight: Optional[str] = None
     explainWrong: Optional[str] = None
 
+
 class MatchingConfigModel(BaseModel):
     leftItems: List[MatchingLeftItemModel]
     rightItems: List[MatchingRightItemModel]
     correctPairs: List[MatchingCorrectPairModel]
+
 
 class SubmittedVariantResponse(BaseModel):
     variantId: UUID
@@ -69,26 +80,33 @@ class SubmittedVariantResponse(BaseModel):
     isRight: bool
     explanation: str
 
+
 class MatchingPairResponse(BaseModel):
     key: str
     value: str
     isRight: bool
     explanation: Optional[str] = None
 
+
 class ChosenVariantModel(BaseModel):
     id: UUID
-    userId: UUID
+    userId: Optional[UUID] = None
     quizId: UUID
     questionId: UUID
     chosenId: Optional[UUID] = None
     answer: Optional[Any] = None
     isRight: Optional[bool] = None
+    answerLeft: Optional[str] = None
+    answerRight: Optional[str] = None
+    explanation: Optional[str] = None
 
-# === Response Models ===
+
+# Response Models
 class SolveQuestionVariantsResponse(BaseModel):
     question: QuestionModel
     submittedVariants: List[SubmittedVariantResponse]
     allVariants: List[VariantModel]
+
 
 class SolveQuestionMatchingResponse(BaseModel):
     question: QuestionModel
@@ -96,7 +114,8 @@ class SolveQuestionMatchingResponse(BaseModel):
     isRight: Optional[bool] = None
     pairs: List[MatchingPairResponse]
     variants: List[VariantModel]
-    explanation: Optional[str] = None  # Исправлено: Optional[str], а не Optional[Optional[str]]
+    explanation: Optional[str] = None
+
 
 class SolveQuestionTextResponse(BaseModel):
     question: QuestionModel
@@ -106,17 +125,21 @@ class SolveQuestionTextResponse(BaseModel):
     variants: List[VariantModel]
     pairs: Optional[List[MatchingPairResponse]] = None
 
+
 SolveQuestionTextResponseUnion = SolveQuestionMatchingResponse | SolveQuestionTextResponse
 
-# === Error Response ===
+
+# Error Response
 class ErrorResponse(BaseModel):
     detail: str
 
-# === Update Models ===
+
+# Update Models
 class UpdateQuestionBody(BaseModel):
     text: Optional[str] = None
     type: Optional[QuestionType] = None
     multiAnswer: Optional[bool] = None  # Упрощено: Optional[bool], null трактуется как не изменено
+
 
 class UpdateQuestionVariant(BaseModel):
     text: str
@@ -124,27 +147,33 @@ class UpdateQuestionVariant(BaseModel):
     explainWrong: str
     isRight: bool
 
+
 class UpdateQuestionVariantsBody(BaseModel):
     variants: List[UpdateQuestionVariant]
+
 
 class UpdateQuestionMatchingConfigBody(BaseModel):
     matchingConfig: MatchingConfigModel
 
-# === Вспомогательная модель для генерации (наш внутренний пакет) ===
+
+# Вспомогательная модель для генерации
 class GeneratedQuestionBundle(BaseModel):
     question: QuestionModel
     variants: List[VariantModel] = Field(default_factory=list)
     matchingConfig: Optional[MatchingConfigModel] = None
     questionType: QuestionType
 
+
 def new_uuid() -> UUID:
     return uuid4()
+
 
 class ExplainQuizRequest(BaseModel):
     quizId: Optional[UUID] = None
     questions: List[GeneratedQuestionBundle]
     text: str = Field(..., description="Исходный текст лекции/конспекта для RAG")
     difficulty: Literal["easy", "medium", "hard"] = "medium"
+
 
 class ExplainQuizResponse(BaseModel):
     quizId: UUID

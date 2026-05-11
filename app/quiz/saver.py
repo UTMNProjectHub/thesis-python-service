@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from string import ascii_lowercase
 from typing import List
 
@@ -61,8 +60,6 @@ def format_quiz_as_markdown(
     ]
     return "".join(parts)
 
-
-# --- CALL OUT FORMAT --- #
 
 def _format_callout_question(question: Question) -> str:
     if isinstance(question, TrueFalseQuestion):
@@ -145,7 +142,7 @@ def _format_callout_question(question: Question) -> str:
 
 
 def _get_callout_options(options: List[str], start_index: int = 0) -> List[str]:
-    letters = ascii_lowercase[start_index : start_index + len(options)]
+    letters = ascii_lowercase[start_index: start_index + len(options)]
     return [f"> {letter}) {opt}" for letter, opt in zip(letters, options)]
 
 
@@ -169,8 +166,6 @@ def _get_callout_matching_answers(
         result_lines.append(f">> {left_letter}) -> {right_letter})")
     return result_lines
 
-
-# --- SPACED REPETITION FORMAT --- #
 
 def _format_spaced_repetition_question(
         question: Question,
@@ -245,7 +240,7 @@ def _format_spaced_repetition_question(
 
 
 def _get_spaced_rep_options(options: List[str], start_index: int = 0) -> List[str]:
-    letters = ascii_lowercase[start_index : start_index + len(options)]
+    letters = ascii_lowercase[start_index: start_index + len(options)]
     return [f"{letter}) {opt}" for letter, opt in zip(letters, options)]
 
 

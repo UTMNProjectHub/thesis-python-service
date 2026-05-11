@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-import asyncio
+import logging
 from typing import Callable, Awaitable
 
 import aio_pika
 from aio_pika import IncomingMessage
+
 from app.api.core.config import settings
-from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncRabbitClient:
@@ -25,22 +27,24 @@ class AsyncRabbitClient:
         self.queue_quiz_gen_complete = "quiz.generation.complete"
         self.queue_summary_gen_complete = "summary.generation.complete"
 
-    # ----------------------------------------------------------------------
     async def connect(self):
         """
         Создаём асинхронное соединение и канал.
         """
         if self.connection:
+            logger.info("RabbitMQ connection already initialized")
             return
 
+        logger.info("Connecting to RabbitMQ heartbeat=%s", settings.amqp_heartbeat)
         self.connection = await aio_pika.connect_robust(
             self.amqp_url,
             client_properties={"connection_name": "AndreyDiplomaWorker"},
+            heartbeat=settings.amqp_heartbeat,
         )
         self.channel = await self.connection.channel()
         await self.channel.set_qos(prefetch_count=1)
+        logger.info("Connected to RabbitMQ with prefetch_count=1")
 
-    # ----------------------------------------------------------------------
     async def publish(self, queue_name: str, payload: dict):
         """
         Публикация сообщений в очередь.
@@ -48,6 +52,7 @@ class AsyncRabbitClient:
         assert self.channel, "RabbitMQ channel not initialized"
 
         queue = await self.channel.declare_queue(queue_name, durable=True)
+        logger.info("Publishing RabbitMQ message queue=%s payload_keys=%s", queue.name, sorted(payload.keys()))
 
         await self.channel.default_exchange.publish(
             aio_pika.Message(
@@ -57,7 +62,6 @@ class AsyncRabbitClient:
             routing_key=queue_name,
         )
 
-    # ----------------------------------------------------------------------
     async def listen(self, queue_name: str, handler: Callable[[dict], Awaitable[None]]):
         """
         Асинхронный слушатель очереди задач.
@@ -66,14 +70,21 @@ class AsyncRabbitClient:
         assert self.channel, "RabbitMQ channel not initialized"
 
         queue = await self.channel.declare_queue(queue_name, durable=True)
+        logger.info("Listening RabbitMQ queue=%s", queue_name)
 
         async def _on_message(message: IncomingMessage):
             async with message.process():
                 try:
                     data = json.loads(message.body.decode("utf-8"))
+                    logger.info(
+                        "RabbitMQ message received queue=%s payload_keys=%s",
+                        queue_name,
+                        sorted(data.keys()),
+                    )
                     await handler(data)
+                    logger.info("RabbitMQ message processed queue=%s", queue_name)
                 except Exception as exc:
-                    print(f"[Rabbit] Error while handling {queue_name}: {exc}")
+                    logger.exception("RabbitMQ handler failed queue=%s error=%s", queue_name, exc)
 
         await queue.consume(_on_message, no_ack=False)
 

@@ -1,26 +1,20 @@
-# app/services/rabbitmq.py
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import threading
 from typing import Callable
-
-import pika
 from urllib.parse import urlparse
 
+import pika
+
 from app.api.core.config import settings
-import asyncio
+
+logger = logging.getLogger(__name__)
 
 
 class RabbitClient:
-    """
-    Клиент RabbitMQ для проекта Андрей Диплом.
-
-    Позволяет:
-    - отправлять задачи (QuizGen, SummaryGen)
-    - слушать очереди результатов (QuizGenComplete, SummaryGenComplete)
-    """
-
     def __init__(
             self,
             host: str,
@@ -40,19 +34,17 @@ class RabbitClient:
             blocked_connection_timeout=None,
         )
 
-        # Названия очередей
         self.queue_quiz_gen = "quiz.generation.request"
         self.queue_summary_gen = "summary.generation.request"
         self.queue_quiz_gen_complete = "quiz.generation.complete"
         self.queue_summary_gen_complete = "summary.generation.complete"
 
-    # ======================================================================
-    # 1. ПУБЛИКАЦИЯ СООБЩЕНИЙ
-    # ======================================================================
     def publish(self, queue: str, payload: dict) -> None:
         """
         Универсальная публикация JSON-сообщения в очередь.
         """
+        logger.info("Publishing RabbitMQ message queue=%s payload_keys=%s", queue, sorted(payload.keys()))
+        logger.info("Opening RabbitMQ blocking connection for publish queue=%s", queue)
         connection = pika.BlockingConnection(self.connection_params)
         channel = connection.channel()
         channel.queue_declare(queue=queue, durable=True)
@@ -67,10 +59,8 @@ class RabbitClient:
         )
 
         connection.close()
+        logger.info("RabbitMQ publish completed queue=%s", queue)
 
-    # ------------------------------------------------------------------
-    # QuizGen → помещаем задачу на генерацию квиза
-    # ------------------------------------------------------------------
     def enqueue_quiz_generation(self, payload: dict):
         """
         payload (QuizGen):
@@ -85,9 +75,6 @@ class RabbitClient:
         """
         self.publish(self.queue_quiz_gen, payload)
 
-    # ------------------------------------------------------------------
-    # SummaryGen → помещаем задачу генерации конспекта
-    # ------------------------------------------------------------------
     def enqueue_summary_generation(self, payload: dict):
         """
         payload (SummaryGen):
@@ -101,17 +88,14 @@ class RabbitClient:
         """
         self.publish(self.queue_summary_gen, payload)
 
-    # ======================================================================
-    # 2. СЛУШАТЕЛЬ ОЧЕРЕДЕЙ
-    # ======================================================================
     def listen(self, queue: str, callback: Callable[[dict], None]):
         """
         Универсальный слушатель очереди.
         Работает в отдельном потоке, чтобы не блокировать FastAPI
-        (или основной поток приложения).
         """
 
         def _thread_worker():
+            logger.info("Opening RabbitMQ blocking connection for listener queue=%s", queue)
             connection = pika.BlockingConnection(self.connection_params)
             channel = connection.channel()
             channel.queue_declare(queue=queue, durable=True)
@@ -119,29 +103,31 @@ class RabbitClient:
             def _on_message(ch, method, properties, body):
                 try:
                     data = json.loads(body.decode("utf-8"))
+                    logger.info(
+                        "RabbitMQ message received queue=%s payload_keys=%s",
+                        queue,
+                        sorted(data.keys()),
+                    )
 
                     result = callback(data)
                     if asyncio.iscoroutine(result):
-                        loop = asyncio.get_event_loop()
-                        loop.create_task(result)
+                        asyncio.run(result)
+                    logger.info("RabbitMQ message processed queue=%s", queue)
 
                 except Exception as e:
-                    print(f"[Rabbit] Ошибка обработки сообщения: {e}")
+                    logger.exception("RabbitMQ handler failed queue=%s error=%s", queue, e)
                 finally:
                     ch.basic_ack(delivery_tag=method.delivery_tag)
 
             channel.basic_qos(prefetch_count=1)
             channel.basic_consume(queue=queue, on_message_callback=_on_message)
 
-            print(f"[Rabbit] Listening on queue: {queue}")
+            logger.info("Listening RabbitMQ queue=%s", queue)
             channel.start_consuming()
 
         thread = threading.Thread(target=_thread_worker, daemon=True)
         thread.start()
 
-    # ------------------------------------------------------------------
-    # Подписка на QuizGenComplete
-    # ------------------------------------------------------------------
     def on_quiz_generation_complete(self, callback: Callable[[dict], None]):
         """
         callback принимает payload (QuizGenComplete):
@@ -153,9 +139,6 @@ class RabbitClient:
         """
         self.listen(self.queue_quiz_gen_complete, callback)
 
-    # ------------------------------------------------------------------
-    # Подписка на SummaryGenComplete
-    # ------------------------------------------------------------------
     def on_summary_generation_complete(self, callback: Callable[[dict], None]):
         """
         callback принимает payload (SummaryGenComplete):
@@ -171,18 +154,13 @@ class RabbitClient:
 
 
 def get_rabbit_client() -> RabbitClient:
-    """
-    Фабрика RabbitClient, берёт строку подключения из settings.amqp_url
-    (переменная окружения / .env: AMQP_URL=amqp://user:pass@host:5672/vhost).
-    """
-    # было: settings.AMQP_URL
     url = urlparse(settings.amqp_url)
 
     username = url.username or "guest"
     password = url.password or "guest"
     host = url.hostname or "localhost"
     port = url.port or 5672
-    vhost = url.path[1:] if url.path.startswith("/") else "/"
+    vhost = (url.path[1:] if url.path.startswith("/") else url.path) or "/"
 
     return RabbitClient(
         host=host,

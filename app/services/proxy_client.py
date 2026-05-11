@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from app.api.core.config import settings
 
-client = OpenAI(api_key=settings.proxyapi_key, base_url=settings.base_url)
+client = AsyncOpenAI(api_key=settings.proxyapi_key, base_url=settings.base_url)
 
 
 async def proxy_completion(
@@ -18,47 +17,30 @@ async def proxy_completion(
         temperature: float = 1.0,
         max_tokens: Optional[int] = None,
 ) -> tuple[str, str]:
-    """
-    Универсальная обёртка над chat.completions.create.
-
-    text          — дополнительный текст (можно передавать исходный контент),
-    user_prompt   — основной запрос (инструкции + данные),
-    system_prompt — роль/контекст модели,
-    temperature   — креативность (для JSON лучше ставить 0–0.3),
-    max_tokens    — лимит токенов для ОТВЕТА (completion). Если None — используем дефолт 800.
-    """
     messages: List[Dict[str, Any]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    # Склеиваем text + user_prompt, как и раньше
-    messages.append({"role": "user", "content": f"{text}\n\n{user_prompt}"})
+    messages.append({"role": "user", "content": f"{text}\n\n{user_prompt}".strip()})
 
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=settings.model,
             messages=messages,
             temperature=temperature,
-            # ключевой момент: даём возможность управлять лимитом
             max_completion_tokens=max_tokens or 1500,
         )
-
-        # Отладочный вывод
-        print("\n=== RAW RESPONSE ===")
-        print(json.dumps(response.model_dump(), ensure_ascii=False, indent=2))
-        print("====================\n")
-
         data = response.model_dump()
         text_out = ""
 
-        if "choices" in data and data["choices"]:
-            text_out = data["choices"][0]["message"]["content"]
-        elif "output" in data and data["output"]:
-            content = data["output"][0]["content"]
-            if content and isinstance(content, list) and "text" in content[0]:
-                text_out = content[0]["text"]
+        if data.get("choices"):
+            text_out = data["choices"][0].get("message", {}).get("content") or ""
+        elif data.get("output"):
+            content = data["output"][0].get("content", [])
+            if content and isinstance(content, list):
+                text_out = content[0].get("text", "")
 
         return text_out.strip(), data.get("model", settings.model)
 
-    except Exception as e:
-        print(f"Ошибка ProxyAPI: {e}")
+    except Exception as exc:
+        print(f"ProxyAPI error: {exc}")
         return "", settings.model

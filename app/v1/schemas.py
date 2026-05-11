@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 from uuid import UUID
+
+from pydantic import BaseModel, Field
 
 from app.quiz.contracts.models import (
     QuestionModel,
@@ -76,4 +77,3 @@ class FAQResponse(BaseModel):
     title: str
     items: List[FAQItemDTO]
     markdown: str  # Готовый Markdown
-

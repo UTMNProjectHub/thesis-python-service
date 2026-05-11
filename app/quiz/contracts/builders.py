@@ -212,6 +212,7 @@ def build_matching_question(
     Каждая пара считается корректной.
     """
     q_id = question_id or new_uuid()
+    pairs = list(pairs)
 
     left_items: List[MatchingLeftItemModel] = []
     right_items: List[MatchingRightItemModel] = []
@@ -240,18 +241,20 @@ def build_matching_question(
     )
 
     variants: List[VariantModel] = []
-    for item in left_items + right_items:
+    for left_text, right_text in pairs:
         base_id = new_uuid()
         variants.append(
             VariantModel(
                 id=new_uuid(),
-                text=item.text,
+                text=f"{left_text} -> {right_text}",
                 explainRight=explain_right_default,
                 explainWrong=explain_wrong_default,
-                isRight=False,  # сама правильность хранится в correctPairs
+                isRight=True,
                 questionId=q_id,
                 variantId=base_id,
                 questionsVariantsId=new_uuid(),
+                leftMatching=left_text,
+                rightMatching=right_text,
             )
         )
 

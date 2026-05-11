@@ -1,23 +1,18 @@
-# app/services/postgres.py
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 from uuid import UUID
-import json
 
 import asyncpg
 
 from app.api.core.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 class PostgresClient:
-    """
-    Асинхронный клиент PostgreSQL.
-    Отвечает за:
-    - получение s3Index для файлов;
-    - сохранение summary (пока в таблицу quizes как type='summary');
-    - сохранение квиза, вопросов, вариантов, FAQ.
-    """
+    """Async PostgreSQL client for worker persistence."""
 
     def __init__(self) -> None:
         self._pool: Optional[asyncpg.Pool] = None
@@ -25,61 +20,32 @@ class PostgresClient:
     async def connect(self) -> asyncpg.Pool:
         if self._pool:
             return self._pool
+
+        logger.info("Postgres pool connecting")
         self._pool = await asyncpg.create_pool(
             dsn=settings.database_url,
             min_size=1,
             max_size=10,
         )
+        logger.info("Postgres pool connected min_size=%d max_size=%d", 1, 10)
         return self._pool
 
-    # ------------------------------------------------------------------
-    # FILES → s3Index
-    # ------------------------------------------------------------------
     async def get_s3_keys_for_file_ids(self, file_ids: List[UUID]) -> List[str]:
-        """
-        SELECT "s3Index" FROM thesis.files WHERE id IN (...)
-        """
         pool = await self.connect()
         rows = await pool.fetch(
             """
-            SELECT "s3Index"
+            SELECT id, "s3Index"
             FROM thesis.files
-            WHERE id = ANY($1::uuid[])
+            WHERE id = ANY ($1::uuid[])
             """,
             file_ids,
         )
-        return [r["s3Index"] for r in rows]
+        result = [r["s3Index"] for r in rows]
+        logger.info("Postgres loaded S3 keys requested=%d found=%d", len(file_ids), len(result))
+        for row in rows:
+            logger.info("Postgres S3 key fileId=%s s3Index=%s", row["id"], row["s3Index"])
+        return result
 
-    # ------------------------------------------------------------------
-    # SUMMARY
-    # ------------------------------------------------------------------
-    async def save_summary_text(
-            self,
-            summary_id: UUID,
-            theme_id: int,
-            markdown: str,
-    ) -> None:
-        """
-        Простая реализация: используем таблицу quizes как хранилище summary.
-        type = 'summary', name = 'Авто-конспект'.
-        """
-        pool = await self.connect()
-        await pool.execute(
-            """
-            INSERT INTO thesis.quizes(id, type, name, description, "themeId")
-            VALUES ($1, 'summary', 'Авто-конспект', $2, $3)
-            ON CONFLICT (id) DO UPDATE
-            SET description = EXCLUDED.description,
-                "themeId"   = EXCLUDED."themeId"
-            """,
-            summary_id,
-            markdown,
-            theme_id,
-        )
-
-    # ------------------------------------------------------------------
-    # QUIZ
-    # ------------------------------------------------------------------
     async def save_quiz_metadata(
             self,
             quiz_id: UUID,
@@ -88,20 +54,27 @@ class PostgresClient:
             description: str,
     ) -> None:
         pool = await self.connect()
+        logger.info(
+            "Postgres saving quiz metadata quizId=%s themeId=%s name=%s",
+            quiz_id,
+            theme_id,
+            name,
+        )
         await pool.execute(
             """
             INSERT INTO thesis.quizes(id, type, name, description, "themeId")
-            VALUES ($1, 'generated', $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE
-            SET name = EXCLUDED.name,
+            VALUES ($1, 'generated', $2, $3, $4) ON CONFLICT (id) DO
+            UPDATE
+                SET name = EXCLUDED.name,
                 description = EXCLUDED.description,
-                "themeId"   = EXCLUDED."themeId"
+                "themeId" = EXCLUDED."themeId"
             """,
             quiz_id,
             name,
             description,
             theme_id,
         )
+        logger.info("Postgres quiz metadata saved quizId=%s", quiz_id)
 
     async def insert_question(
             self,
@@ -111,6 +84,12 @@ class PostgresClient:
             multi_answer: bool,
     ) -> None:
         pool = await self.connect()
+        logger.info(
+            "Postgres inserting question questionId=%s type=%s multiAnswer=%s",
+            question_id,
+            qtype,
+            multi_answer,
+        )
         await pool.execute(
             """
             INSERT INTO thesis.questions(id, type, text, "multiAnswer")
@@ -121,6 +100,7 @@ class PostgresClient:
             text,
             multi_answer,
         )
+        logger.info("Postgres question inserted questionId=%s", question_id)
 
     async def insert_variant(
             self,
@@ -128,18 +108,29 @@ class PostgresClient:
             text: str,
             explain_right: str,
             explain_wrong: str,
+            left_matching: Optional[str] = None,
+            right_matching: Optional[str] = None,
     ) -> None:
         pool = await self.connect()
+        logger.info(
+            "Postgres inserting variant variantId=%s hasMatching=%s text_len=%d",
+            variant_id,
+            left_matching is not None or right_matching is not None,
+            len(text),
+        )
         await pool.execute(
             """
-            INSERT INTO thesis.variants(id, text, "explainRight", "explainWrong")
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO thesis.variants(id, text, "explainRight", "explainWrong", "leftMatching", "rightMatching")
+            VALUES ($1, $2, $3, $4, $5, $6)
             """,
             variant_id,
             text,
             explain_right,
             explain_wrong,
+            left_matching,
+            right_matching,
         )
+        logger.info("Postgres variant inserted variantId=%s", variant_id)
 
     async def insert_question_variant_link(
             self,
@@ -147,28 +138,26 @@ class PostgresClient:
             question_id: UUID,
             variant_id: Optional[UUID],
             is_right: bool,
-            matching_config: Optional[dict],
     ) -> None:
         pool = await self.connect()
-
-        if matching_config is not None and not isinstance(matching_config, str):
-            matching_config_db = json.dumps(matching_config, ensure_ascii=False)
-        else:
-            matching_config_db = matching_config
-
+        logger.info(
+            "Postgres linking question variant linkId=%s questionId=%s variantId=%s isRight=%s",
+            link_id,
+            question_id,
+            variant_id,
+            is_right,
+        )
         await pool.execute(
             """
-            INSERT INTO thesis.questions_variants(
-                id, "questionId", "variantId", "isRight", "matchingConfig"
-            )
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO thesis.questions_variants(id, "questionId", "variantId", "isRight")
+            VALUES ($1, $2, $3, $4)
             """,
             link_id,
             question_id,
             variant_id,
             is_right,
-            matching_config_db,
         )
+        logger.info("Postgres question variant linked linkId=%s", link_id)
 
     async def link_question_to_quiz(
             self,
@@ -177,6 +166,7 @@ class PostgresClient:
             question_id: UUID,
     ) -> None:
         pool = await self.connect()
+        logger.info("Postgres linking quiz question linkId=%s quizId=%s questionId=%s", link_id, quiz_id, question_id)
         await pool.execute(
             """
             INSERT INTO thesis.quizes_questions(id, "quizId", "questionId")
@@ -186,12 +176,11 @@ class PostgresClient:
             quiz_id,
             question_id,
         )
+        logger.info("Postgres quiz question linked linkId=%s", link_id)
 
     async def get_theme_name(self, theme_id: int) -> Optional[str]:
-        """
-        Возвращает name из thesis.themes по id.
-        """
         pool = await self.connect()
+        logger.info("Postgres loading theme name themeId=%s", theme_id)
         row = await pool.fetchrow(
             """
             SELECT name
@@ -200,7 +189,9 @@ class PostgresClient:
             """,
             theme_id,
         )
-        return row["name"] if row else None
+        theme_name = row["name"] if row else None
+        logger.info("Postgres theme name loaded themeId=%s found=%s", theme_id, theme_name is not None)
+        return theme_name
 
     async def insert_reference_question(
             self,
@@ -209,6 +200,12 @@ class PostgresClient:
             file_id: UUID,
     ) -> None:
         pool = await self.connect()
+        logger.info(
+            "Postgres inserting question reference refId=%s questionId=%s fileId=%s",
+            ref_id,
+            question_id,
+            file_id,
+        )
         await pool.execute(
             """
             INSERT INTO thesis.references_question(id, "questionId", "fileId")
@@ -218,10 +215,8 @@ class PostgresClient:
             question_id,
             file_id,
         )
+        logger.info("Postgres question reference inserted refId=%s", ref_id)
 
-    # ------------------------------------------------------------------
-    # FAQ (минимальная реализация)
-    # ------------------------------------------------------------------
     async def insert_faq_item(
             self,
             faq_id: UUID,
@@ -229,11 +224,8 @@ class PostgresClient:
             answer: str,
             category: Optional[str],
     ) -> None:
-        """
-        Пока складываем FAQ в таблицу questions с типом 'faq'.
-        При необходимости можно вынести в отдельную таблицу.
-        """
         pool = await self.connect()
+        logger.info("Postgres inserting FAQ item faqId=%s category=%s", faq_id, category)
         await pool.execute(
             """
             INSERT INTO thesis.questions(id, type, text)
@@ -242,60 +234,41 @@ class PostgresClient:
             faq_id,
             question,
         )
-        # answer/category можно хранить в отдельной таблице — сейчас опускаем
+        logger.info("Postgres FAQ item inserted faqId=%s answer_len=%d", faq_id, len(answer))
 
-        # ------------------------------------------------------------------
-    # SUMMARY
-    # ------------------------------------------------------------------
     async def save_summary_text(
             self,
-            summary_id: UUID,          # это будет id в thesis.files.id
+            summary_id: UUID,
             theme_id: int,
-            s3_key: str,               # ключ в S3 (s3Index)
-            file_name: str,            # читаемое имя файла
+            s3_key: str,
+            file_name: str,
             user_id: Optional[UUID] = None,
     ) -> int:
-        """
-        Сохранение метаданных конспекта.
-
-        Делает три вещи:
-
-        1) thesis.files:
-           - id        = summary_id (uuid)
-           - name      = file_name
-           - s3Index   = s3_key
-           - userId    = user_id
-
-        2) thesis.summaries:
-           - subjectId = берём из thesis.themes.subjectId (если есть)
-           - themeId   = theme_id
-           - fileId    = summary_id
-
-        3) thesis.references_summary:
-           - summaryId = id из thesis.summaries
-           - fileId    = summary_id
-
-        Возвращает integer id из thesis.summaries.
-        """
         pool = await self.connect()
+        logger.info(
+            "Postgres saving summary metadata fileId=%s themeId=%s s3_key=%s userId=%s",
+            summary_id,
+            theme_id,
+            s3_key,
+            user_id,
+        )
 
-        # 1. создаём/обновляем запись в thesis.files
         await pool.execute(
             """
             INSERT INTO thesis.files(id, name, "s3Index", "userId")
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (id) DO UPDATE
-            SET name    = EXCLUDED.name,
+            VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO
+            UPDATE
+                SET name = EXCLUDED.name,
                 "s3Index" = EXCLUDED."s3Index",
-                "userId"  = EXCLUDED."userId"
+                "userId" = EXCLUDED."userId"
             """,
             summary_id,
             file_name,
             s3_key,
             user_id,
         )
+        logger.info("Postgres summary file metadata saved fileId=%s", summary_id)
 
-        # 2. вытаскиваем subjectId из thesis.themes (он nullable)
         row = await pool.fetchrow(
             """
             SELECT "subjectId"
@@ -305,21 +278,20 @@ class PostgresClient:
             theme_id,
         )
         subject_id = row["subjectId"] if row else None
+        logger.info("Postgres summary subject resolved fileId=%s subjectId=%s", summary_id, subject_id)
 
-        # 3. создаём запись в thesis.summaries
         summary_row = await pool.fetchrow(
             """
             INSERT INTO thesis.summaries("subjectId", "themeId", "fileId")
-            VALUES ($1, $2, $3)
-            RETURNING id
+            VALUES ($1, $2, $3) RETURNING id
             """,
             subject_id,
             theme_id,
             summary_id,
         )
         summary_db_id: int = summary_row["id"]
+        logger.info("Postgres summary row inserted summaryDbId=%s fileId=%s", summary_db_id, summary_id)
 
-        # 4. создаём связь в thesis.references_summary
         await pool.execute(
             """
             INSERT INTO thesis.references_summary("summaryId", "fileId")
@@ -328,9 +300,9 @@ class PostgresClient:
             summary_db_id,
             summary_id,
         )
+        logger.info("Postgres summary reference inserted summaryDbId=%s fileId=%s", summary_db_id, summary_id)
 
         return summary_db_id
-
 
 
 def get_postgres_client() -> PostgresClient:

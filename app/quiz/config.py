@@ -54,8 +54,6 @@ class SavingConfig:
 
 @dataclass
 class QuizSettings:
-    # ВАЖНО: используем default_factory, чтобы для каждого QuizSettings
-    # создавался СВОЙ экземпляр GeneralConfig/GenerationConfig/SavingConfig
     general: GeneralConfig = field(default_factory=GeneralConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     saving: SavingConfig = field(default_factory=SavingConfig)

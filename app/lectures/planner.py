@@ -5,8 +5,8 @@ import re
 from typing import List, Tuple
 
 from app.curriculum.models import LectureTopic, DifficultyLevel
-from app.documents.models import DocumentChunk
 from app.documents.indexers.base import BaseRetriever
+from app.documents.models import DocumentChunk
 from app.lectures.models import LecturePlan, LectureSection, SectionKind
 from app.services.proxy_client import proxy_completion
 
@@ -210,10 +210,9 @@ async def build_lecture_plan_for_topic(
         text="",
         user_prompt=user_prompt,
         system_prompt=system_prompt,
-        temperature=0.3,   # для JSON-структуры лучше маленькая температура
-        max_tokens=1600,   # даём модели договорить план до конца
+        temperature=0.3,  # для JSON-структуры лучше маленькая температура
+        max_tokens=3000,  # даём модели договорить план до конца
     )
-
 
     # --- 5. Парсим JSON и собираем LecturePlan ---
     data = _extract_json_block(raw_text)

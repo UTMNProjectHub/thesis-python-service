@@ -5,8 +5,8 @@ from typing import List, Tuple
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from app.documents.models import DocumentChunk
 from app.documents.indexers.base import BaseRetriever
+from app.documents.models import DocumentChunk
 
 
 class TfidfRetriever(BaseRetriever):

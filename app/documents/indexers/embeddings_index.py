@@ -5,8 +5,9 @@ from typing import List, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from app.documents.models import DocumentChunk
+from app.documents.chunking import estimate_tokens, split_long_text
 from app.documents.indexers.base import BaseRetriever
+from app.documents.models import DocumentChunk
 from app.services.embeddings_client import OpenAIEmbeddingsClient
 
 
@@ -23,6 +24,27 @@ class EmbeddingsRetriever(BaseRetriever):
         self._chunks: List[DocumentChunk] = []
         self._embeddings: np.ndarray | None = None  # shape: (N, dim)
 
+    @staticmethod
+    def _split_oversized_chunks(chunks: List[DocumentChunk], max_tokens: int = 700) -> List[DocumentChunk]:
+        result: List[DocumentChunk] = []
+        for chunk in chunks:
+            if estimate_tokens(chunk.text) < max_tokens:
+                result.append(chunk)
+                continue
+
+            for index, piece in enumerate(split_long_text(chunk.text, max_tokens=max_tokens)):
+                result.append(
+                    DocumentChunk(
+                        doc_id=chunk.doc_id,
+                        chunk_id=f"{chunk.chunk_id}-emb-{index}",
+                        text=piece,
+                        page_start=chunk.page_start,
+                        page_end=chunk.page_end,
+                        heading_path=chunk.heading_path,
+                    )
+                )
+        return result
+
     def index(self, chunks: List[DocumentChunk]) -> None:
         """
         Строим эмбеддинги для всех чанков и сохраняем их в памяти.
@@ -32,7 +54,8 @@ class EmbeddingsRetriever(BaseRetriever):
             self._embeddings = None
             return
 
-        texts = [c.text for c in chunks]
+        safe_chunks = self._split_oversized_chunks(chunks)
+        texts = [c.text for c in safe_chunks]
         embeddings = self.backend.embed_texts(texts)
 
         if not embeddings:
@@ -40,7 +63,7 @@ class EmbeddingsRetriever(BaseRetriever):
             self._embeddings = None
             return
 
-        self._chunks = chunks
+        self._chunks = safe_chunks
         self._embeddings = np.asarray(embeddings, dtype="float32")
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:

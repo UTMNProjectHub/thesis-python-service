@@ -47,7 +47,7 @@ def search_topics(
             topic.title,
             topic.description or "",
             " ".join(topic.keywords or []),
-            ]).lower()
+        ]).lower()
 
         if q in haystack:
             results.append(topic)
