@@ -1,12 +1,14 @@
-# app/services/embeddings_client.py
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import List
 
 from openai import OpenAI, AsyncOpenAI
 
 from app.api.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,16 +21,14 @@ class OpenAIEmbeddingsClient:
       • асинхронный режим (async_mode=True)
     """
     model: str | None = None
-    async_mode: bool = False  # по умолчанию — синхронный
+    async_mode: bool = False
 
     def __post_init__(self) -> None:
-        # Всегда создаём синхронный клиент
         self.sync_client = OpenAI(
             api_key=settings.proxyapi_key,
             base_url=settings.base_url,
         )
 
-        # Асинхронный клиент — только если явно включён
         if self.async_mode:
             self.async_client = AsyncOpenAI(
                 api_key=settings.proxyapi_key,
@@ -38,7 +38,6 @@ class OpenAIEmbeddingsClient:
         if self.model is None:
             self.model = settings.embedding_model
 
-    # --------------------- СИНХРОННЫЙ МЕТОД ---------------------
     def embed_texts(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
         """Синхронная версия — использует self.sync_client"""
         if not texts:
@@ -56,7 +55,6 @@ class OpenAIEmbeddingsClient:
 
         return all_embeddings
 
-    # --------------------- АСИНХРОННЫЙ МЕТОД ---------------------
     async def embed_texts_async(self, texts: List[str], batch_size: int = 32) -> List[List[float]]:
         """Асинхронная версия — требует async_mode=True"""
         if not self.async_mode:
@@ -81,16 +79,10 @@ class OpenAIEmbeddingsClient:
         return all_embeddings
 
 
-# --------------------- ГЛОБАЛЬНЫЕ ЭКЗЕМПЛЯРЫ ---------------------
-
-# Синхронный клиент — для всех обычных скриптов и тестов
 embeddings_client = OpenAIEmbeddingsClient(async_mode=False)
 
-# Асинхронный клиент — для асинхронных модулей (rag, explainer, checker)
 embeddings_client_async = OpenAIEmbeddingsClient(async_mode=True)
 
-
-# --------------------- УДОБНЫЕ ФУНКЦИИ ---------------------
 
 def get_embeddings_sync(texts: List[str]) -> List[List[float]]:
     """Синхронная обёртка — используйте в main_explainer_and_quiz_generate.py"""

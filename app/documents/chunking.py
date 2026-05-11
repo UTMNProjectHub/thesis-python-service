@@ -29,6 +29,35 @@ def split_into_paragraphs(page_text: str) -> List[str]:
     return paragraphs or [normalized]
 
 
+def split_long_text(text: str, max_tokens: int) -> List[str]:
+    max_chars = max(500, max_tokens * 3)
+    normalized = text.strip()
+    if not normalized:
+        return []
+    if len(normalized) <= max_chars:
+        return [normalized]
+
+    pieces: List[str] = []
+    start = 0
+    while start < len(normalized):
+        end = min(start + max_chars, len(normalized))
+        if end < len(normalized):
+            split_at = max(
+                normalized.rfind("\n", start, end),
+                normalized.rfind(". ", start, end),
+                normalized.rfind(" ", start, end),
+            )
+            if split_at > start + max_chars // 2:
+                end = split_at + 1
+
+        piece = normalized[start:end].strip()
+        if piece:
+            pieces.append(piece)
+        start = end
+
+    return pieces
+
+
 def chunk_document_pages(
         doc: Document,
         pages_text: List[str],
@@ -72,59 +101,50 @@ def chunk_document_pages(
         chunks.append(chunk)
         chunk_index += 1
 
-        # сбрасываем буферы
         current_buffer = []
         current_tokens = 0
 
-    # основной цикл по страницам
     for page_idx, page_text in enumerate(pages_text):
         page_num = page_idx + 1  # 1-based
         paragraphs = split_into_paragraphs(page_text)
 
         if not paragraphs:
-            # пустая страница — просто продолжаем
             continue
 
-        # если в буфере ничего нет, стартовая страница нового чанка = текущая
         if not current_buffer:
             current_page_start = page_num
 
         for para in paragraphs:
             para_tokens = estimate_tokens(para)
 
-            # если абзац сам по себе больше max_tokens — сохраняем как отдельный чанк
-            # чтобы не зависнуть в бесконечном объединении
             if para_tokens >= max_tokens:
-                # сначала сбрасываем текущий чанк, если что-то накопилось
                 flush_chunk()
-                current_page_start = page_num
-                current_page_end = page_num
-                chunk_id = f"{doc.id}-chunk-{chunk_index}"
-                chunks.append(
-                    DocumentChunk(
-                        doc_id=doc.id,
-                        chunk_id=chunk_id,
-                        text=para,
-                        page_start=page_num,
-                        page_end=page_num,
-                        heading_path=None,
+                for piece in split_long_text(para, max_tokens=max_tokens):
+                    current_page_start = page_num
+                    current_page_end = page_num
+                    chunk_id = f"{doc.id}-chunk-{chunk_index}"
+                    chunks.append(
+                        DocumentChunk(
+                            doc_id=doc.id,
+                            chunk_id=chunk_id,
+                            text=piece,
+                            page_start=page_num,
+                            page_end=page_num,
+                            heading_path=None,
+                        )
                     )
-                )
-                chunk_index += 1
+                    chunk_index += 1
                 continue
 
-            # если добавление абзаца переполнит чанк — сначала сбрасываем текущий
             if current_tokens + para_tokens > max_tokens and current_buffer:
                 current_page_end = page_num
                 flush_chunk()
-                current_page_start = page_num  # новый чанк начинается с текущей страницы
+                current_page_start = page_num
 
-            # добавляем абзац в текущий чанк
             current_buffer.append(para)
             current_tokens += para_tokens
             current_page_end = page_num
 
-    # после прохода по всем страницам сбрасываем всё, что осталось
     flush_chunk()
 
     return chunks

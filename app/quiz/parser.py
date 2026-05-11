@@ -15,7 +15,6 @@ from .models import (
     ShortOrLongAnswerQuestion,
 )
 
-
 # --- Общие регулярки для callout-парсера --- #
 
 CALL_OUT_QUESTION_RE = re.compile(
@@ -159,7 +158,7 @@ class QuizParser:
 
         # Ответы после [!success]
         answer_letters: List[str] = []
-        for line in block_lines[idx_success + 1 :]:
+        for line in block_lines[idx_success + 1:]:
             stripped = line.strip()
             m_ans = CALL_OUT_ANSWER_LETTER_RE.match(stripped)
             if not m_ans:
@@ -254,7 +253,7 @@ class QuizParser:
 
         # Пары a) -> n)
         pairs_letters: List[tuple[str, str]] = []
-        for line in block_lines[idx_success + 1 :]:
+        for line in block_lines[idx_success + 1:]:
             stripped = line.strip()
             m_pair = PAIR_RE.match(stripped)
             if not m_pair:
@@ -299,7 +298,7 @@ class QuizParser:
 
         # Первый ответ после [!success]
         answer_line = None
-        for line in block_lines[idx_success + 1 :]:
+        for line in block_lines[idx_success + 1:]:
             stripped = line.strip()
             m = CALL_OUT_ANSWER_TEXT_RE.match(stripped)
             if m:
@@ -355,25 +354,25 @@ class QuizParser:
             + re.escape(inline_sep)
             + r"\s*(?P<answer>.+?)\s*$",
             flags=re.IGNORECASE,
-            )
+        )
         fib_re = re.compile(
             r"^\s*\*\*Fill in the Blank:\*\*\s*(?P<question>.+?)\s*"
             + re.escape(inline_sep)
             + r"\s*(?P<answer>.+?)\s*$",
             flags=re.IGNORECASE,
-            )
+        )
         short_re = re.compile(
             r"^\s*\*\*Short Answer:\*\*\s*(?P<question>.+?)\s*"
             + re.escape(inline_sep)
             + r"\s*(?P<answer>.+?)\s*$",
             flags=re.IGNORECASE,
-            )
+        )
         long_re = re.compile(
             r"^\s*\*\*Long Answer:\*\*\s*(?P<question>.+?)\s*"
             + re.escape(inline_sep)
             + r"\s*(?P<answer>.+?)\s*$",
             flags=re.IGNORECASE,
-            )
+        )
         mc_header_re = re.compile(
             r"^\s*\*\*Multiple Choice:\*\*\s*(?P<question>.+?)\s*$",
             flags=re.IGNORECASE,

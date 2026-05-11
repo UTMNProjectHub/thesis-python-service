@@ -22,19 +22,19 @@ from .models import GeneratedQuestionBundle
 
 def question_to_bundle(q: Question) -> GeneratedQuestionBundle:
     """
-    Адаптер: наши внутренние типы (как в Obsidian-плагине)
-    → контрактный GeneratedQuestionBundle (QuestionModel + VariantModel + MatchingConfig).
+    Адаптер: внутренние типы
+    -> контрактный GeneratedQuestionBundle (QuestionModel + VariantModel + MatchingConfig).
     """
 
     # True / False
-    if isinstance(q, TrueFalse):
+    if isinstance(q, TrueFalseQuestion):
         return build_truefalse_question(
             text=q.question,
             correct_answer=bool(q.answer),
         )
 
     # Обычный multiple choice (один правильный)
-    if isinstance(q, MultipleChoice):
+    if isinstance(q, MultipleChoiceQuestion):
         return build_multichoice_question(
             text=q.question,
             options=list(q.options),
@@ -42,7 +42,7 @@ def question_to_bundle(q: Question) -> GeneratedQuestionBundle:
         )
 
     # Select all that apply -> multichoice с multiAnswer=True
-    if isinstance(q, SelectAllThatApply):
+    if isinstance(q, SelectAllThatApplyQuestion):
         return build_multichoice_question(
             text=q.question,
             options=list(q.options),
@@ -53,7 +53,7 @@ def question_to_bundle(q: Question) -> GeneratedQuestionBundle:
     # Fill in the blank
     # Внутри нашего типа: answer: list[str]
     # В контракте: shortanswer с несколькими эталонными вариантами.
-    if isinstance(q, FillInTheBlank):
+    if isinstance(q, FillInTheBlankQuestion):
         return build_text_question(
             text=q.question,
             correct_answers=list(q.answer),
@@ -61,15 +61,15 @@ def question_to_bundle(q: Question) -> GeneratedQuestionBundle:
         )
 
     # Matching
-    if isinstance(q, Matching):
-        pairs = [(p.leftOption, p.rightOption) for p in q.answer]
+    if isinstance(q, MatchingQuestion):
+        pairs = [(p.left_option, p.right_option) for p in q.answer]
         return build_matching_question(
             text=q.question,
             pairs=pairs,
         )
 
     # Short / Long answer
-    if isinstance(q, ShortOrLongAnswer):
+    if isinstance(q, ShortOrLongAnswerQuestion):
         # определяем тип по длине ответа (как и раньше)
         q_type = "shortanswer" if len(q.answer) < 250 else "essay"
         return build_text_question(

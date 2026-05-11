@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
-from app.lectures.models import LecturePlan, LectureSection
-from app.documents.models import DocumentChunk
 from app.documents.indexers.base import BaseRetriever
+from app.documents.models import DocumentChunk
+from app.lectures.models import LecturePlan, LectureSection
 from app.lectures.planner import _build_context_from_chunks, _difficulty_comment
 from app.services.proxy_client import proxy_completion
 

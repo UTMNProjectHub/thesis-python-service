@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import List, Tuple, Dict
 
-from app.documents.models import DocumentChunk
 from app.documents.indexers.base import BaseRetriever
-from app.documents.indexers.tfidf_index import TfidfRetriever
 from app.documents.indexers.embeddings_index import EmbeddingsRetriever
+from app.documents.indexers.tfidf_index import TfidfRetriever
+from app.documents.models import DocumentChunk
 
 
 class HybridRetriever(BaseRetriever):
@@ -47,14 +47,11 @@ class HybridRetriever(BaseRetriever):
         """
         Делаем два поиска (TF-IDF и эмбеддинги), объединяем результаты.
         """
-        # Берём побольше кандидатов, чем итоговый top_k
-        # чтобы дать гибриду пространство для комбинирования.
         base_k = max(top_k * 3, 10)
 
         tfidf_results = self.tfidf.search(query, top_k=base_k)
         emb_results = self.emb.search(query, top_k=base_k)
 
-        # Если вдруг один из ретриверов ничего не нашёл — fallback на другой
         if not tfidf_results and not emb_results:
             return []
         if not tfidf_results:
@@ -65,7 +62,6 @@ class HybridRetriever(BaseRetriever):
         combined_scores: Dict[str, float] = {}
         chunks_map: Dict[str, DocumentChunk] = {}
 
-        # Нормализуем немного: складываем скора с весами
         for chunk, score in tfidf_results:
             cid = chunk.chunk_id
             chunks_map[cid] = chunk
@@ -78,7 +74,6 @@ class HybridRetriever(BaseRetriever):
             combined_scores.setdefault(cid, 0.0)
             combined_scores[cid] += self.alpha * score
 
-        # Сортируем по комбинированному скору
         ranked = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
 
         results: List[Tuple[DocumentChunk, float]] = []

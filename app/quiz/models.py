@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Literal, Union
+from uuid import UUID, uuid4
+
 from pydantic import BaseModel, Field
-from uuid import UUID
 
 QuestionType = Literal[
     "true_false", "multiple_choice", "select_all_that_apply",
     "fill_in_the_blank", "matching", "short_answer", "long_answer"
 ]
+
 
 @dataclass
 class AnswerVariant:
@@ -17,13 +19,15 @@ class AnswerVariant:
     is_correct: bool
     explanation: str = ""  # Почему (не)верно
 
+
 @dataclass
 class MatchingPair:
     left_option: str
     right_option: str
 
+
 class QuizQuestion(BaseModel):
-    id: UUID = Field(default_factory=UUID)
+    id: UUID = Field(default_factory=uuid4)
     text: str
     type: QuestionType
     variants: Optional[List[AnswerVariant]] = None
@@ -32,11 +36,11 @@ class QuizQuestion(BaseModel):
     general_explanation: str = ""  # Общее для правильного (open-ended)
 
 
-# Для checker.py
 class UserAnswer(BaseModel):
     question_index: int
     selected_option_ids: Optional[List[str]] = None
     text_answer: Optional[str] = None
+
 
 class CheckResponseItem(BaseModel):
     question_index: int
@@ -44,10 +48,12 @@ class CheckResponseItem(BaseModel):
     explanation: str
     correct_options: List[str]
 
+
 class CheckResponse(BaseModel):
     results: List[CheckResponseItem]
     total_correct: int
     total_questions: int
+
 
 @dataclass
 class TrueFalseQuestion:
@@ -96,7 +102,7 @@ class ShortOrLongAnswerQuestion:
     answer: str
 
 
-# Объединённый тип вопроса (аналог TS-типа Question).
+# Объединённый тип вопроса
 Question = Union[
     TrueFalseQuestion,
     MultipleChoiceQuestion,
@@ -109,7 +115,7 @@ Question = Union[
 
 @dataclass
 class AnswerOption:
-    id: str                     # "A", "B", "C", "D"
+    id: str  # "A", "B", "C", "D"
     text: str
     is_correct: bool = False
 
@@ -120,7 +126,7 @@ class GeneratedQuiz:
     title: str
     difficulty: Literal["easy", "medium", "hard"]
     questions: List[QuizQuestion]
-    source_file_ids: List[UUID]
+    source_file_ids: List[UUID] = field(default_factory=list)
 
 
 @dataclass

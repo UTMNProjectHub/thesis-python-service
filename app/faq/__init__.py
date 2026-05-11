@@ -1,6 +1,6 @@
-from .models import FAQItem, FAQ
-from .generator import generate_faq_from_text
 from .config import FAQGenerationConfig
+from .generator import generate_faq_from_text
+from .models import FAQItem, FAQ
 
 __all__ = [
     "FAQItem",

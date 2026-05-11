@@ -1,20 +1,18 @@
 from __future__ import annotations
+
+import asyncio
 from typing import List, Optional
-import asyncio
 
-from app.services.proxy_client import proxy_completion
-from app.quiz.rag import SimpleVectorStore
 from app.quiz.models import QuizQuestion, AnswerVariant, QuestionType
-
-from uuid import uuid4
-import asyncio
+from app.quiz.rag import SimpleVectorStore
+from app.services.proxy_client import proxy_completion
 
 
 async def generate_explanations(
         question: QuizQuestion,
         context_chunks: List[str],
         difficulty: str = "medium"
-        ) -> None:
+) -> None:
     """
     Генерирует объяснения для вариантов или общее для open-ended.
     - Для TF: для каждого варианта.
@@ -58,12 +56,13 @@ async def generate_explanations(
             difficulty_hint=difficulty_hint
         )
 
+
 async def _explain_variant(
         base_prompt: str,
         variant: AnswerVariant,
         question_type: QuestionType,
         difficulty_hint: str
-    ) -> str:
+) -> str:
     if variant.is_correct:
         user_prompt = f"""
         Правильный вариант: "{variant.text}"
@@ -98,11 +97,12 @@ async def _explain_variant(
     )
     return explanation.strip() or "Объяснение недоступно."  # Fallback
 
+
 async def _explain_general_correct(
         base_prompt: str,
         correct_answer: Optional[str | List[str]],
         difficulty_hint: str
-        ) -> str:
+) -> str:
     ans_str = correct_answer if isinstance(correct_answer, str) else ", ".join(correct_answer or [])
     user_prompt = f"""
     Правильный ответ: "{ans_str}"
@@ -121,12 +121,14 @@ async def _explain_general_correct(
     )
     return explanation.strip() or "Объяснение недоступно."  # Fallback
 
+
 def _get_variant_text(variant):
     if hasattr(variant, "text"):
         return getattr(variant, "text")
     if isinstance(variant, dict):
         return variant.get("text", "")
     return str(variant)
+
 
 def _set_variant_explanation(variant, explanation: str):
     if hasattr(variant, "explanation"):
@@ -139,9 +141,9 @@ def _set_variant_explanation(variant, explanation: str):
         except Exception:
             pass
 
+
 async def _explain_variant_via_proxy(base_prompt: str, variant_text: str, is_correct: bool,
                                      question_type: str, difficulty_hint: str) -> str:
-
     if is_correct:
         user = f'''
     Правильный вариант: "{variant_text}"
@@ -203,8 +205,7 @@ async def generate_all_explanations_async(
         questions: List[QuizQuestion],
         rag_store: SimpleVectorStore,
         difficulty: str = "medium"
-    ) -> None:
-
+) -> None:
     difficulty_hint = {
         "easy": "Объясняй как для новичка, с примерами.",
         "medium": "Средний уровень, без лишней сложности.",
@@ -272,12 +273,35 @@ def format_markdown_with_explanations(questions: List[QuizQuestion]) -> str:
     lines: List[str] = []
 
     for idx, q in enumerate(questions, start=1):
-        lines.append(f"### Вопрос {idx}:")
+        lines.append(f"### Вопрос {idx}")
         lines.append("")
-        # ... (оставляем весь ваш текст форматтера)
-        # Но именно здесь нужно вставить полный текст форматтера из main_explainer_and_quiz_generate.py
-        # Я опускаю повтор во избежание дублирования длинного кода
-        pass
+        lines.append(q.text)
+        lines.append("")
+
+        if q.variants:
+            for variant in q.variants:
+                text = _get_variant_text(variant)
+                is_correct = bool(getattr(variant, "is_correct", False))
+                if isinstance(variant, dict):
+                    is_correct = bool(variant.get("is_correct", False))
+                explanation = getattr(variant, "explanation", "")
+                if isinstance(variant, dict):
+                    explanation = variant.get("explanation", "")
+                marker = "верно" if is_correct else "неверно"
+                lines.append(f"- **{text}** ({marker})")
+                if explanation:
+                    lines.append(f"  {explanation}")
+            lines.append("")
+        elif q.matching_pairs:
+            lines.append("Правильные соответствия:")
+            for pair in q.matching_pairs:
+                lines.append(f"- {pair.left_option} -> {pair.right_option}")
+            lines.append("")
+        elif q.correct_answer:
+            lines.append(f"**Правильный ответ:** {q.correct_answer}")
+            if q.general_explanation:
+                lines.append("")
+                lines.append(q.general_explanation)
+            lines.append("")
 
     return "\n".join(lines).strip()
-

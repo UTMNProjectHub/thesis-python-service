@@ -9,9 +9,14 @@ from app.faq.config import FAQGenerationConfig
 from app.faq.generator import format_faq_as_markdown, generate_faq_from_file
 from app.quiz.checker import check_quiz_answers
 from app.quiz.contracts.adapters import questions_to_bundles
+from app.quiz.contracts.converters import contract_to_internal, internal_to_contract
+from app.quiz.contracts.models import ExplainQuizRequest, ExplainQuizResponse
+from app.quiz.explainer import generate_all_explanations_async, format_markdown_with_explanations
 from app.quiz.generation.config import QuizGenerationConfig
 from app.quiz.generation.service import generate_quiz_from_text
-from app.quiz.models import GeneratedQuiz as InternalQuiz, QuizQuestion as InternalQuestion
+from app.quiz.models import GeneratedQuiz as InternalQuiz
+from app.quiz.models import UserAnswer, CheckResponse
+from app.quiz.rag import SimpleVectorStore
 from app.services.proxy_client import proxy_completion
 from app.services.similarity import (
     cosine_similarity_pdfs_matrix,
@@ -31,14 +36,6 @@ from app.v1.schemas import (
     SimilarityRequest,
     TopicPairRequest,
 )
-
-from app.quiz.explainer import generate_all_explanations_async, format_markdown_with_explanations
-from app.quiz.rag import SimpleVectorStore
-from app.quiz.contracts.models import ExplainQuizRequest, ExplainQuizResponse
-from app.quiz.contracts.converters import contract_to_internal, internal_to_contract
-
-
-from app.quiz.models import UserAnswer, CheckResponse  # Импорт внутренних для checker
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +101,27 @@ async def generate_quiz(req: QuizGenerationRequest) -> QuizGenerationResponse:
     Генерирует квиз на основе темы.
     """
     try:
-        cfg = QuizGenerationConfig()  # Настройте по req (например, num_questions=req.number_of_questions)
-        internal_questions: List[InternalQuestion] = await generate_quiz_from_text(note_text=req.topic, cfg=cfg)
+        question_count = max(1, req.number_of_questions)
+        cfg = QuizGenerationConfig(
+            language=req.language,
+            generate_true_false=False,
+            num_true_false=0,
+            generate_multiple_choice=True,
+            num_multiple_choice=question_count,
+            generate_select_all_that_apply=False,
+            num_select_all_that_apply=0,
+            generate_fill_in_the_blank=False,
+            num_fill_in_the_blank=0,
+            generate_matching=False,
+            num_matching=0,
+            generate_short_answer=False,
+            num_short_answer=0,
+            generate_long_answer=False,
+            num_long_answer=0,
+        )
+        internal_questions = await generate_quiz_from_text(note_text=req.topic, cfg=cfg)
 
-        bundles = questions_to_bundles(internal_questions)  # Адаптация внутренних в контрактные
+        bundles = questions_to_bundles(internal_questions)
 
         dto_questions: List[GeneratedQuestionDTO] = [
             GeneratedQuestionDTO(
@@ -150,9 +164,9 @@ async def generate_faq(req: FAQGenerationRequest):
 
 @router.post("/quiz/check", response_model=CheckResponse)
 async def check_quiz(
-        quiz: InternalQuiz = Body(...),  # Внутренняя модель как body
+        quiz: InternalQuiz = Body(...),
         answers: List[UserAnswer] = Body(...),
-        source_text: str = Body(...),  # Текст как часть body
+        source_text: str = Body(...),
         document_id: str = "temp"
 ):
     if not quiz.questions:
@@ -162,6 +176,7 @@ async def check_quiz(
     except Exception as e:
         logger.error(f"Ошибка проверки квиза: {e}")
         raise HTTPException(status_code=500, detail="Ошибка проверки квиза")
+
 
 @router.post("/quiz/explain", response_model=ExplainQuizResponse)
 async def explain_quiz(request: ExplainQuizRequest):

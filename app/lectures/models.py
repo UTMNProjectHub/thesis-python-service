@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional
+from typing import List
 
 from pydantic import BaseModel, Field
 
@@ -12,12 +12,12 @@ class SectionKind(str, Enum):
     """
     Тип секции лекции. Используется как мягкий ориентир для генерации текста.
     """
-    INTRO = "intro"          # Введение, постановка контекста
-    THEORY = "theory"        # Теория, определения, формулы
-    EXAMPLES = "examples"    # Примеры, разбор кейсов
-    PRACTICE = "practice"    # Практика, задачи, упражнения
-    SUMMARY = "summary"      # Итоги, выводы, повторение
-    OTHER = "other"          # Другое / смешанный тип
+    INTRO = "intro"  # Введение, постановка контекста
+    THEORY = "theory"  # Теория, определения, формулы
+    EXAMPLES = "examples"  # Примеры, разбор кейсов
+    PRACTICE = "practice"  # Практика, задачи, упражнения
+    SUMMARY = "summary"  # Итоги, выводы, повторение
+    OTHER = "other"  # Другое / смешанный тип
 
 
 class LectureSection(BaseModel):

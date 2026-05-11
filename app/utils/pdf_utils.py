@@ -10,7 +10,6 @@ def extract_text_from_pdf(path: str) -> str:
             chunks.append(text)
         full_text = "\n".join(chunks).strip()
         if not full_text:
-            # На случай пустых/сканированных PDF
             full_text = ""
         return full_text
     except FileNotFoundError:

@@ -27,7 +27,8 @@ def extract_pdf_pages(path: str | Path) -> List[str]:
     return pages_text
 
 
-def load_pdf_document(path: str | Path, doc_id: str | None = None, title: str | None = None) -> Tuple[Document, List[str]]:
+def load_pdf_document(path: str | Path, doc_id: str | None = None, title: str | None = None) -> Tuple[
+    Document, List[str]]:
     """
     Загружает PDF как Document + список текстов страниц.
 

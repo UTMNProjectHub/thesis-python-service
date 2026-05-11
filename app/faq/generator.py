@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import json
-import re
+from pathlib import Path
 from typing import List, Optional
 
-from app.services.proxy_client import proxy_completion
-from app.documents.pdf_reader import load_pdf_document
-from app.documents.docx_reader import load_docx_document
 from app.documents.chunking import chunk_document_pages
-from app.documents.models import Document
-from app.lectures.planner import _build_context_from_chunks  # Для чанков, если нужно
-from pathlib import Path
-from .models import FAQ, FAQItem
+from app.documents.docx_reader import load_docx_document
+from app.documents.pdf_reader import load_pdf_document
+from app.services.proxy_client import proxy_completion
 from .config import FAQGenerationConfig
+from .models import FAQ, FAQItem
 
 
 def _strip_code_fence(text: str) -> str:

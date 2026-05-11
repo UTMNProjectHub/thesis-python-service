@@ -38,13 +38,10 @@ def _extract_topics_from_text(full_text: str) -> List[LectureTopic]:
     """
     topics: List[LectureTopic] = []
 
-    # Нормализуем переносы строк
     text = full_text.replace("\r\n", "\n")
 
-    # Разобьём на строки
     lines = [ln.strip() for ln in text.split("\n")]
 
-    # Регексы для разных вариантов записи тем
     patterns = [
         re.compile(r"^Тема\s+(\d+)[\.\:]\s*(.+)$", re.IGNORECASE),
         re.compile(r"^Тема\s*[:\-]\s*(.+)$", re.IGNORECASE),
@@ -92,7 +89,6 @@ def _extract_topics_from_text(full_text: str) -> List[LectureTopic]:
         topics.append(topic)
         order_counter += 1
 
-    # Удалим дубликаты по id (если РПД странно размечен)
     unique_by_id: dict[str, LectureTopic] = {}
     for t in topics:
         if t.id not in unique_by_id:
