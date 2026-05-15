@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, List, Optional
 from uuid import UUID
 
@@ -9,6 +10,13 @@ import asyncpg
 from app.api.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FileRecord:
+    file_id: UUID
+    name: str
+    s3_index: str
 
 
 class PostgresClient:
@@ -44,6 +52,35 @@ class PostgresClient:
         logger.info("Postgres loaded S3 keys requested=%d found=%d", len(file_ids), len(result))
         for row in rows:
             logger.info("Postgres S3 key fileId=%s s3Index=%s", row["id"], row["s3Index"])
+        return result
+
+    async def get_file_records_for_file_ids(self, file_ids: List[UUID]) -> List[FileRecord]:
+        pool = await self.connect()
+        rows = await pool.fetch(
+            """
+            SELECT id, name, "s3Index"
+            FROM thesis.files
+            WHERE id = ANY ($1::uuid[])
+            """,
+            file_ids,
+        )
+        by_id = {
+            row["id"]: FileRecord(
+                file_id=row["id"],
+                name=row["name"],
+                s3_index=row["s3Index"],
+            )
+            for row in rows
+        }
+        result = [by_id[file_id] for file_id in file_ids if file_id in by_id]
+        logger.info("Postgres loaded file records requested=%d found=%d", len(file_ids), len(result))
+        for record in result:
+            logger.info(
+                "Postgres file record fileId=%s name=%s s3Index=%s",
+                record.file_id,
+                record.name,
+                record.s3_index,
+            )
         return result
 
     async def get_summary_context(self, summary_id: int) -> Optional[dict[str, Any]]:

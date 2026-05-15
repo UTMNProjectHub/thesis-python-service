@@ -12,3 +12,4 @@ def configure_logging() -> None:
         level=level,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
+    logging.getLogger("PyPDF2._cmap").setLevel(logging.ERROR)

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,64 @@ logger = logging.getLogger(__name__)
 
 FILES_DIR = Path("files_materials")
 FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class _FileLock:
+    def __init__(self, path: Path, timeout_seconds: float, stale_seconds: float | None = None) -> None:
+        self.path = path
+        self.timeout_seconds = timeout_seconds
+        self.stale_seconds = stale_seconds
+        self._fd: int | None = None
+
+    def _remove_if_stale(self) -> bool:
+        if self.stale_seconds is None or self.stale_seconds <= 0 or not self.path.exists():
+            return False
+
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except OSError:
+            return False
+
+        if age < self.stale_seconds:
+            return False
+
+        try:
+            self.path.unlink()
+            logger.warning("Removed stale S3 cache lock path=%s age_seconds=%.1f", self.path, age)
+            return True
+        except OSError as e:
+            logger.warning("Could not remove stale S3 cache lock path=%s error=%s", self.path, e)
+            return False
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + max(self.timeout_seconds, 0.0)
+
+        while True:
+            try:
+                self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                payload = f"pid={os.getpid()} created_at={datetime.now(timezone.utc).isoformat()}\n"
+                os.write(self._fd, payload.encode("utf-8"))
+                return True
+            except FileExistsError:
+                if self._remove_if_stale():
+                    continue
+                if not blocking:
+                    return False
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for S3 cache lock: {self.path}")
+                time.sleep(0.2)
+
+    def release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Could not remove S3 cache lock path=%s error=%s", self.path, e)
 
 
 def _normalize_endpoint(raw_endpoint: str) -> tuple[str, bool]:
@@ -54,8 +113,14 @@ class S3Client:
         self.cache_dir = Path(settings.s3_download_cache_dir)
         self.cache_index_path = self.cache_dir / "index.json"
         self.cache_ttl_tasks = settings.s3_download_cache_ttl_tasks
+        self.cache_lock_timeout_seconds = settings.s3_download_cache_lock_timeout_seconds
+        self.cache_stale_temp_seconds = settings.s3_download_cache_stale_temp_seconds
+        self.cache_stale_lock_seconds = settings.s3_download_cache_stale_lock_seconds
+        self.cache_io_retries = settings.s3_download_cache_io_retries
+        self.cache_io_retry_delay_seconds = settings.s3_download_cache_io_retry_delay_seconds
         self._cache_lock = threading.RLock()
         self._object_locks: dict[str, threading.RLock] = {}
+        self._held_usage_locks: dict[str, dict[str, Any]] = {}
 
         logger.info(
             "Initializing S3 client endpoint=%s secure=%s region=%s bucket=%s",
@@ -111,6 +176,7 @@ class S3Client:
     def _prepare_cache(self) -> None:
         if self.cache_enabled:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._cleanup_stale_cache_files()
             logger.info(
                 "S3 download cache enabled dir=%s ttl_tasks=%d",
                 self.cache_dir,
@@ -170,6 +236,170 @@ class S3Client:
                 self._object_locks[cache_key] = lock
             return lock
 
+    def _cache_lock_path(self, cache_key: str) -> Path:
+        return self.cache_dir / f"{cache_key}.lock"
+
+    def _index_lock_path(self) -> Path:
+        return self.cache_dir / "index.lock"
+
+    def _new_lock(self, path: Path) -> _FileLock:
+        return _FileLock(
+            path,
+            self.cache_lock_timeout_seconds,
+            stale_seconds=self.cache_stale_lock_seconds,
+        )
+
+    def _index_lock(self) -> _FileLock:
+        return self._new_lock(self._index_lock_path())
+
+    def _is_retryable_io_error(self, exc: OSError) -> bool:
+        winerror = getattr(exc, "winerror", None)
+        return winerror in (5, 32) or isinstance(exc, PermissionError)
+
+    def _retry_io(self, operation, description: str):
+        attempts = max(int(self.cache_io_retries), 0) + 1
+        delay = max(float(self.cache_io_retry_delay_seconds), 0.0)
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation()
+            except OSError as e:
+                if not self._is_retryable_io_error(e) or attempt >= attempts:
+                    raise
+                sleep_for = min(delay * (2 ** (attempt - 1)), 3.0)
+                logger.warning(
+                    "Retrying S3 cache IO operation description=%s attempt=%d/%d sleep=%.2f error=%s",
+                    description,
+                    attempt,
+                    attempts,
+                    sleep_for,
+                    e,
+                )
+                time.sleep(sleep_for)
+        return None
+
+    def _replace_file_with_retry(self, source: Path, destination: Path) -> None:
+        self._retry_io(lambda: os.replace(source, destination), f"replace {source} -> {destination}")
+
+    def _unlink_with_retry(self, path: Path, description: str) -> bool:
+        if not path.exists():
+            return True
+
+        try:
+            self._retry_io(path.unlink, description)
+            return True
+        except OSError as e:
+            logger.warning("S3 cache file could not be removed path=%s description=%s error=%s", path, description, e)
+            return False
+
+    def _cleanup_stale_cache_files(self) -> None:
+        if not self.cache_dir.exists():
+            return
+
+        now = time.time()
+        removed: list[str] = []
+        patterns = ("*.download", "*.part.minio", "index.*.tmp")
+        for pattern in patterns:
+            for path in self.cache_dir.glob(pattern):
+                try:
+                    age = now - path.stat().st_mtime
+                except OSError:
+                    continue
+                if age < self.cache_stale_temp_seconds:
+                    continue
+                if self._unlink_with_retry(path, f"stale temp cleanup age={age:.1f}"):
+                    removed.append(str(path))
+
+        for path in self.cache_dir.glob("*.lock"):
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < self.cache_stale_lock_seconds:
+                continue
+            if self._unlink_with_retry(path, f"stale lock cleanup age={age:.1f}"):
+                removed.append(str(path))
+
+        if removed:
+            logger.info("S3 cache stale files removed count=%d files=%s", len(removed), removed)
+
+    @staticmethod
+    def _held_lock_id(task_id: str, cache_key: str) -> str:
+        return f"{task_id}:{cache_key}"
+
+    def _acquire_cache_usage_lock(self, cache_key: str, task_id: str | None) -> _FileLock:
+        if task_id:
+            held_id = self._held_lock_id(task_id, cache_key)
+            with self._cache_lock:
+                held = self._held_usage_locks.get(held_id)
+                if held is not None:
+                    held["count"] = int(held.get("count", 1)) + 1
+                    logger.info(
+                        "S3 cache usage lock reused taskId=%s key=%s count=%d",
+                        task_id,
+                        cache_key,
+                        held["count"],
+                    )
+                    return held["lock"]
+
+        lock = self._new_lock(self._cache_lock_path(cache_key))
+        lock.acquire(blocking=True)
+        if task_id:
+            with self._cache_lock:
+                self._held_usage_locks[self._held_lock_id(task_id, cache_key)] = {
+                    "lock": lock,
+                    "count": 1,
+                }
+            logger.info("S3 cache usage lock acquired taskId=%s key=%s", task_id, cache_key)
+        else:
+            logger.info("S3 cache transient lock acquired key=%s", cache_key)
+        return lock
+
+    def _release_cache_usage_lock(
+            self,
+            cache_key: str,
+            task_id: str | None,
+            lock: _FileLock | None = None,
+            *,
+            release_all: bool = False,
+    ) -> None:
+        if task_id:
+            held_id = self._held_lock_id(task_id, cache_key)
+            with self._cache_lock:
+                held = self._held_usage_locks.get(held_id)
+                if held is None:
+                    return
+                count = int(held.get("count", 1))
+                if count > 1 and not release_all:
+                    held["count"] = count - 1
+                    return
+                lock = held["lock"]
+                del self._held_usage_locks[held_id]
+
+        if lock is not None:
+            lock.release()
+            logger.info("S3 cache usage lock released taskId=%s key=%s", task_id, cache_key)
+
+    def _try_acquire_cache_cleanup_lock(self, cache_key: str) -> _FileLock | None:
+        lock = self._new_lock(self._cache_lock_path(cache_key))
+        if not lock.acquire(blocking=False):
+            return None
+        return lock
+
+    def _stream_object_to_file(self, object_name: str, destination: Path) -> None:
+        response = None
+        try:
+            response = self.client.get_object(self.bucket_name, object_name)
+            with destination.open("wb") as f:
+                for chunk in response.stream(1024 * 1024):
+                    f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            if response is not None:
+                response.close()
+                response.release_conn()
+
     def _empty_cache_index(self) -> dict[str, Any]:
         return {"version": 1, "entries": {}}
 
@@ -193,9 +423,15 @@ class S3Client:
     def _save_cache_index(self, index: dict[str, Any]) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         tmp_path = self.cache_index_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, self.cache_index_path)
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(index, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            self._replace_file_with_retry(tmp_path, self.cache_index_path)
+        finally:
+            if tmp_path.exists():
+                self._unlink_with_retry(tmp_path, "cache index temp cleanup")
 
     @staticmethod
     def _metadata_hash(metadata: Optional[dict[str, str]]) -> Optional[str]:
@@ -360,87 +596,130 @@ class S3Client:
             "unused_tasks": 0,
             "last_used_at": datetime.now(timezone.utc).isoformat(),
         }
-        self._save_cache_index(index)
 
-    def _download_to_cache(self, object_name: str) -> str:
+    def _with_index(self, callback):
+        index_lock = self._index_lock()
+        index_lock.acquire(blocking=True)
+        try:
+            with self._cache_lock:
+                index = self._load_cache_index()
+                result = callback(index)
+                self._save_cache_index(index)
+                return result
+        finally:
+            index_lock.release()
+
+    def _download_to_cache(self, object_name: str, task_id: str | None = None) -> str:
         candidates = self._object_candidates(object_name)
         last_error: S3Error | None = None
 
         for candidate in candidates:
             cache_key = self._cache_key(candidate)
-            lock = self._get_object_lock(cache_key)
+            thread_lock = self._get_object_lock(cache_key)
 
-            with lock:
+            with thread_lock:
+                usage_lock: _FileLock | None = None
+                keep_usage_lock = False
                 try:
-                    stat = self.client.stat_object(self.bucket_name, candidate)
-                except S3Error as e:
-                    last_error = e
-                    if getattr(e, "code", None) == "NoSuchKey":
-                        logger.warning(
-                            "S3 cache candidate missing bucket=%s object=%s original_object=%s",
+                    usage_lock = self._acquire_cache_usage_lock(cache_key, task_id)
+                    try:
+                        stat = self.client.stat_object(self.bucket_name, candidate)
+                    except S3Error as e:
+                        last_error = e
+                        if getattr(e, "code", None) == "NoSuchKey":
+                            logger.warning(
+                                "S3 cache candidate missing bucket=%s object=%s original_object=%s",
+                                self.bucket_name,
+                                candidate,
+                                object_name,
+                            )
+                            continue
+                        logger.exception(
+                            "S3 cache stat failed bucket=%s object=%s error=%s",
                             self.bucket_name,
                             candidate,
-                            object_name,
+                            e,
                         )
-                        continue
-                    logger.exception("S3 cache stat failed bucket=%s object=%s error=%s", self.bucket_name, candidate,
-                                     e)
-                    raise
+                        raise
 
-                cache_path = self._cache_path(candidate)
-                with self._cache_lock:
-                    index = self._load_cache_index()
-                    if self._cached_file_is_valid(cache_key, cache_path, stat, index):
-                        entry = index["entries"].setdefault(cache_key, {})
-                        entry["unused_tasks"] = 0
-                        entry["last_used_at"] = datetime.now(timezone.utc).isoformat()
-                        entry["path"] = str(cache_path)
-                        self._save_cache_index(index)
-                        logger.info("S3 cache hit bucket=%s object=%s path=%s", self.bucket_name, candidate, cache_path)
+                    cache_path = self._cache_path(candidate)
+
+                    def mark_cache_hit(index: dict[str, Any]) -> bool:
+                        if self._cached_file_is_valid(cache_key, cache_path, stat, index):
+                            entry = index["entries"].setdefault(cache_key, {})
+                            entry["unused_tasks"] = 0
+                            entry["last_used_at"] = datetime.now(timezone.utc).isoformat()
+                            entry["path"] = str(cache_path)
+                            return True
+                        return False
+
+                    if self._with_index(mark_cache_hit):
+                        logger.info(
+                            "S3 cache hit bucket=%s object=%s path=%s taskId=%s",
+                            self.bucket_name,
+                            candidate,
+                            cache_path,
+                            task_id,
+                        )
+                        keep_usage_lock = task_id is not None
                         return str(cache_path)
 
-                tmp_path = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.download")
-                try:
+                    tmp_path = cache_path.with_name(f"{cache_path.name}.{uuid.uuid4().hex}.download")
+                    try:
+                        self._cleanup_stale_cache_files()
+                        logger.info(
+                            "S3 cache miss, downloading bucket=%s object=%s cache_path=%s taskId=%s",
+                            self.bucket_name,
+                            candidate,
+                            cache_path,
+                            task_id,
+                        )
+                        self._stream_object_to_file(candidate, tmp_path)
+                        self._replace_file_with_retry(tmp_path, cache_path)
+                    finally:
+                        if tmp_path.exists():
+                            self._unlink_with_retry(tmp_path, "cache download temp cleanup")
+
+                    def write_downloaded_entry(index: dict[str, Any]) -> None:
+                        if not self._downloaded_file_matches_stat(cache_path, stat):
+                            raise RuntimeError(f"S3 cache validation failed for object {candidate!r}")
+                        self._write_cache_entry(cache_key, cache_path, candidate, stat, index)
+
+                    self._with_index(write_downloaded_entry)
+
                     logger.info(
-                        "S3 cache miss, downloading bucket=%s object=%s cache_path=%s",
+                        "S3 cache stored bucket=%s object=%s path=%s taskId=%s",
                         self.bucket_name,
                         candidate,
                         cache_path,
+                        task_id,
                     )
-                    self.client.fget_object(self.bucket_name, candidate, str(tmp_path))
-                    os.replace(tmp_path, cache_path)
+                    keep_usage_lock = task_id is not None
+                    return str(cache_path)
                 finally:
-                    if tmp_path.exists():
-                        try:
-                            tmp_path.unlink()
-                        except OSError:
-                            logger.warning("Could not remove S3 cache temp file path=%s", tmp_path)
-
-                with self._cache_lock:
-                    index = self._load_cache_index()
-                    if not self._downloaded_file_matches_stat(cache_path, stat):
-                        raise RuntimeError(f"S3 cache validation failed for object {candidate!r}")
-                    self._write_cache_entry(cache_key, cache_path, candidate, stat, index)
-
-                logger.info("S3 cache stored bucket=%s object=%s path=%s", self.bucket_name, candidate, cache_path)
-                return str(cache_path)
+                    if not keep_usage_lock:
+                        self._release_cache_usage_lock(cache_key, task_id, usage_lock)
 
         self._log_missing_object_context(object_name, candidates)
         assert last_error is not None
         raise last_error
 
-    def finish_task_cache_usage(self, used_object_names: List[str]) -> None:
+    def finish_task_cache_usage(self, used_object_names: List[str], task_id: str | None = None) -> None:
         if not self.cache_enabled:
             return
 
+        task_id_str = str(task_id) if task_id is not None else None
         used_keys = {
             self._cache_key(candidate)
             for object_name in used_object_names
             for candidate in self._object_candidates(object_name)
         }
 
-        with self._cache_lock:
-            index = self._load_cache_index()
+        if task_id_str:
+            for cache_key in used_keys:
+                self._release_cache_usage_lock(cache_key, task_id_str, release_all=True)
+
+        def update_index(index: dict[str, Any]) -> list[str]:
             entries = index.get("entries", {})
             deleted: list[str] = []
 
@@ -453,16 +732,21 @@ class S3Client:
                 entry["unused_tasks"] = int(entry.get("unused_tasks", 0)) + 1
                 if self.cache_ttl_tasks >= 0 and entry["unused_tasks"] >= self.cache_ttl_tasks:
                     cache_path = Path(entry.get("path", ""))
-                    try:
-                        if cache_path.exists():
-                            cache_path.unlink()
-                    except OSError as e:
-                        logger.warning("S3 cache file could not be removed path=%s error=%s", cache_path, e)
+                    cleanup_lock = self._try_acquire_cache_cleanup_lock(cache_key)
+                    if cleanup_lock is None:
+                        logger.info("S3 cache TTL skipped locked file key=%s path=%s", cache_key, cache_path)
                         continue
+                    try:
+                        if cache_path.exists() and not self._unlink_with_retry(cache_path, "cache TTL cleanup"):
+                            continue
+                    finally:
+                        cleanup_lock.release()
                     deleted.append(str(cache_path))
                     del entries[cache_key]
 
-            self._save_cache_index(index)
+            return deleted
+
+        deleted = self._with_index(update_index)
 
         if deleted:
             logger.info("S3 cache TTL removed files count=%d files=%s", len(deleted), deleted)
@@ -601,9 +885,14 @@ class S3Client:
         )
         raise last_error
 
-    def download_to_materials(self, object_name: str, materials_dir: Path | str = FILES_DIR) -> str:
+    def download_to_materials(
+            self,
+            object_name: str,
+            materials_dir: Path | str = FILES_DIR,
+            task_id: str | None = None,
+    ) -> str:
         if self.cache_enabled:
-            return self._download_to_cache(object_name)
+            return self._download_to_cache(object_name, task_id=task_id)
 
         filename = self._normalize_object_name(object_name).split("/")[-1]
         dest = Path(materials_dir) / filename

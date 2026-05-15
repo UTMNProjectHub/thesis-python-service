@@ -68,7 +68,9 @@ class RabbitClient:
         payload (QuizGen):
         {
             quizId: uuid,
+            userId: uuid,
             files: uuid[],
+            summaryId: number,
             difficulty: "easy"|"medium"|"hard",
             question_count: number,
             question_types: string[],
@@ -84,6 +86,7 @@ class RabbitClient:
             summaryId: uuid,
             subjectId: number,
             themeId: number,
+            userId: uuid,
             files: uuid[],
             additional_requirements: text
         }
@@ -150,6 +153,7 @@ class RabbitClient:
         callback принимает payload (QuizGenComplete):
         {
             quizId: uuid,
+            userId: uuid,
             status: "SUCCESS"|"FAILED",
             error: string
         }
@@ -163,6 +167,7 @@ class RabbitClient:
             summaryId: uuid,
             subjectId: number,
             themeId: number,
+            userId: uuid,
             status: "SUCCESS"|"FAILED",
             error: string
         }

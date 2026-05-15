@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4, UUID
 
+from pydantic import ValidationError
+
 from app.api.core.config import settings
 from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.documents.chunking import chunk_document_pages
@@ -15,6 +17,8 @@ from app.documents.docx_reader import extract_docx_text
 from app.documents.indexers import HybridRetriever
 from app.documents.pdf_reader import load_pdf_document
 from app.faq import FAQGenerationConfig, format_faq_as_markdown, generate_faq_from_text
+from app.lectures.context_policy import build_context_policy
+from app.lectures.context_selection import build_document_profiles
 from app.lectures import build_lecture_plan_for_topic, generate_lecture_markdown
 from app.quiz.explainer import generate_explanations
 from app.quiz.generation import QuizGenerationConfig, generate_quiz_from_text
@@ -33,6 +37,13 @@ from app.quiz.models import (
 )
 from app.quiz.rag import SimpleVectorStore
 from app.services.postgres import PostgresClient
+from app.services.contracts import (
+    QuizGenComplete,
+    QuizGenRequest,
+    SummaryGenComplete,
+    SummaryGenRequest,
+    to_payload,
+)
 from app.services.rabbitmq import RabbitClient
 from app.services.s3_client import S3Client
 from app.utils.md_to_pdf import markdown_to_pdf
@@ -182,7 +193,12 @@ class TaskProcessor:
                 key,
                 work_dir,
             )
-            local_file = await asyncio.to_thread(self.s3.download_to_materials, key, work_dir)
+            local_file = await asyncio.to_thread(
+                self.s3.download_to_materials,
+                key,
+                work_dir,
+                str(task_id),
+            )
             local_files.append(local_file)
         return local_files
 
@@ -490,7 +506,12 @@ class TaskProcessor:
                 work_dir,
             )
 
-            local_file = await asyncio.to_thread(self.s3.download_to_materials, lecture_s3_key, work_dir)
+            local_file = await asyncio.to_thread(
+                self.s3.download_to_materials,
+                lecture_s3_key,
+                work_dir,
+                str(faq_id),
+            )
             source_path = Path(local_file)
             logger.info("FAQGen source downloaded faqId=%s path=%s", faq_id, source_path)
 
@@ -570,7 +591,11 @@ class TaskProcessor:
                 },
             )
         finally:
-            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)
+            await asyncio.to_thread(
+                self.s3.finish_task_cache_usage,
+                s3_keys,
+                str(faq_id) if faq_id is not None else None,
+            )
 
     async def handle_summary_gen(self, payload: dict) -> None:
         """
@@ -579,26 +604,35 @@ class TaskProcessor:
             summaryId: uuid,
             subjectId: number,
             themeId: number,
+            userId: uuid,
             files: uuid[],
             additional_requirements: text
         }
         """
-        summary_id = UUID(payload["summaryId"])
-        subject_id = payload["subjectId"]
-        theme_id = payload["themeId"]
-        file_ids = [UUID(fid) for fid in payload["files"]]
-        additional_req = payload.get("additional_requirements") or ""
-        logger.info(
-            "SummaryGen started summaryId=%s subjectId=%s themeId=%s files=%d additional_requirements_len=%d",
-            summary_id,
-            subject_id,
-            theme_id,
-            len(file_ids),
-            len(additional_req),
-        )
-
         s3_keys: List[str] = []
+        summary_id = str(payload.get("summaryId", ""))
+        subject_id = payload.get("subjectId")
+        theme_id = payload.get("themeId")
+        user_id = str(payload.get("userId", ""))
+
         try:
+            request = SummaryGenRequest.model_validate(payload)
+            summary_id = request.summary_id
+            subject_id = request.subject_id
+            theme_id = request.theme_id
+            user_id = request.user_id
+            file_ids = request.files
+            additional_req = request.additional_requirements or ""
+            logger.info(
+                "SummaryGen started summaryId=%s subjectId=%s themeId=%s userId=%s files=%d additional_requirements_len=%d",
+                summary_id,
+                subject_id,
+                theme_id,
+                user_id,
+                len(file_ids),
+                len(additional_req),
+            )
+
             work_dir = self._work_dir("summary", summary_id)
             logger.info("SummaryGen work dir prepared summaryId=%s path=%s", summary_id, work_dir)
 
@@ -607,69 +641,129 @@ class TaskProcessor:
             logger.info("SummaryGen theme resolved summaryId=%s theme=%s", summary_id, theme_name)
 
             summary_file_id = uuid4()
-            # 1) s3Index из БД
-            s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
-            logger.info("SummaryGen S3 keys loaded summaryId=%s count=%d", summary_id, len(s3_keys))
-            if len(s3_keys) != len(file_ids):
-                logger.warning(
-                    "SummaryGen S3 key count mismatch summaryId=%s requested_files=%d found_keys=%d",
-                    summary_id,
-                    len(file_ids),
-                    len(s3_keys),
-                )
+            file_records = await self.db.get_file_records_for_file_ids(file_ids)
+            if len(file_records) != len(file_ids):
+                found_ids = {record.file_id for record in file_records}
+                missing = [str(file_id) for file_id in file_ids if file_id not in found_ids]
+                raise RuntimeError(f"SummaryGen source files not found in DB: {missing}")
+
+            s3_keys = [record.s3_index for record in file_records]
+            logger.info("SummaryGen file records loaded summaryId=%s count=%d", summary_id, len(file_records))
 
             local_files = await self._download_s3_keys(s3_keys, work_dir, "SummaryGen", summary_id)
             logger.info("SummaryGen files downloaded summaryId=%s count=%d", summary_id, len(local_files))
 
-            pdf_files = [Path(f) for f in local_files if f and f.lower().endswith(".pdf")]
-            if not pdf_files:
-                raise RuntimeError("Не найден PDF-файл среди materials для SummaryGen")
+            documents = []
+            chunks_by_doc = {}
+            all_chunks = []
+            for record, local_file in zip(file_records, local_files):
+                if not local_file:
+                    continue
+                pdf_path = Path(local_file)
+                if pdf_path.suffix.lower() != ".pdf":
+                    logger.warning(
+                        "SummaryGen skipped non-PDF file summaryId=%s fileId=%s path=%s",
+                        summary_id,
+                        record.file_id,
+                        pdf_path,
+                    )
+                    continue
 
-            pdf_path = pdf_files[0]
-            logger.info("SummaryGen selected PDF summaryId=%s path=%s", summary_id, pdf_path)
+                doc, pages = await asyncio.to_thread(load_pdf_document, str(pdf_path), str(record.file_id), record.name)
+                chunks = await asyncio.to_thread(
+                    chunk_document_pages,
+                    doc,
+                    pages,
+                    max_tokens=settings.lecture_chunk_tokens,
+                )
+                logger.info(
+                    "SummaryGen PDF parsed summaryId=%s fileId=%s document=%s pages=%d chunks=%d",
+                    summary_id,
+                    record.file_id,
+                    doc.id,
+                    doc.pages,
+                    len(chunks),
+                )
+                documents.append(doc)
+                chunks_by_doc[doc.id] = chunks
+                all_chunks.extend(chunks)
 
-            doc, pages = await asyncio.to_thread(load_pdf_document, str(pdf_path))
-            chunks = await asyncio.to_thread(chunk_document_pages, doc, pages, max_tokens=700)
-            logger.info(
-                "SummaryGen PDF parsed summaryId=%s document=%s pages=%d chunks=%d",
-                summary_id,
-                doc.id,
-                doc.pages,
-                len(chunks),
+            if not documents:
+                raise RuntimeError("No PDF files found for SummaryGen")
+            if not all_chunks:
+                raise RuntimeError("No text chunks extracted from selected PDF files")
+
+            policy = build_context_policy(
+                doc_count=len(documents),
+                total_chunks=len(all_chunks),
+                document_profiles_enabled=settings.lecture_document_profiles_enabled,
             )
+            logger.info(
+                "SummaryGen context policy summaryId=%s target_words=%d sections=%d plan_chunks=%d section_chunks=%d plan_pool=%d section_pool=%d profiles_enabled=%s",
+                summary_id,
+                policy.target_words,
+                policy.target_sections,
+                policy.plan_context_chunks,
+                policy.section_context_chunks,
+                policy.plan_pool_k,
+                policy.section_pool_k,
+                settings.lecture_document_profiles_enabled,
+            )
+
             retriever = HybridRetriever(alpha=0.7)
-            await asyncio.to_thread(retriever.index, chunks)
+            await asyncio.to_thread(retriever.index, all_chunks)
 
             topic = LectureTopic(
                 id=str(summary_file_id),
                 title=f"Авто-конспект по теме {theme_name}",
-                description=f"Автоматически сгенерированный конспект.",
+                description="Автоматически сгенерированный конспект.",
                 difficulty=DifficultyLevel.MEDIUM,
                 keywords=[],
                 duration_min=90,
-                source_docs=[doc.id],
+                source_docs=[doc.id for doc in documents],
                 order=1,
             )
+
+            document_profiles = []
+            if settings.lecture_document_profiles_enabled:
+                document_profiles = await build_document_profiles(
+                    documents,
+                    chunks_by_doc,
+                    topic=topic,
+                    additional_requirements=additional_req,
+                    chunks_per_doc=policy.profile_chunks_per_doc,
+                    max_tokens=settings.lecture_doc_profile_max_tokens,
+                )
+                logger.info(
+                    "SummaryGen document profiles built summaryId=%s count=%d",
+                    summary_id,
+                    len(document_profiles),
+                )
 
             plan = await build_lecture_plan_for_topic(
                 topic,
                 retriever=retriever,
-                top_k_chunks=8,
-                min_sections=3,
-                max_sections=7,
+                top_k_chunks=policy.plan_context_chunks,
+                retrieval_pool_k=policy.plan_pool_k,
+                context_token_budget=policy.plan_context_token_budget,
+                document_profiles=document_profiles,
+                additional_requirements=additional_req,
+                min_sections=policy.target_sections,
+                max_sections=policy.target_sections,
             )
-            logger.info(
-                "SummaryGen lecture plan built summaryId=%s sections=%d",
-                summary_id,
-                len(plan.sections),
-            )
+            logger.info("SummaryGen lecture plan built summaryId=%s sections=%d", summary_id, len(plan.sections))
 
             lecture_md = await generate_lecture_markdown(
                 plan=plan,
                 retriever=retriever,
                 topic_description=topic.description,
-                max_tokens_per_section=1500,
-                top_k_chunks_per_section=5,
+                max_tokens_per_section=policy.section_output_tokens,
+                top_k_chunks_per_section=policy.section_context_chunks,
+                retrieval_pool_k=policy.section_pool_k,
+                context_token_budget=policy.section_context_token_budget,
+                additional_requirements=additional_req,
+                final_edit_enabled=settings.lecture_final_edit_enabled,
+                final_edit_input_token_budget=policy.final_edit_input_token_budget,
             )
             logger.info("SummaryGen lecture markdown generated summaryId=%s chars=%d", summary_id, len(lecture_md))
 
@@ -680,14 +774,13 @@ class TaskProcessor:
             await asyncio.to_thread(markdown_to_pdf, summary_path, pdf_path)
             logger.info("SummaryGen PDF exported summaryId=%s path=%s", summary_id, pdf_path)
 
-            file_name = f"auto conspect on theme.pdf"
-
+            file_name = "auto conspect on theme.pdf"
             s3_key = await asyncio.to_thread(
                 self.s3.upload_file_to_bucket,
                 local_path=str(pdf_path),
                 original_name=file_name,
-                bucket='summaries/',
-                user_id=None,
+                bucket="summaries",
+                user_id=str(user_id),
             )
 
             await self.db.save_summary_text(
@@ -695,38 +788,46 @@ class TaskProcessor:
                 theme_id=theme_id,
                 s3_key=s3_key,
                 file_name=file_name,
-                user_id=None,
+                user_id=user_id,
             )
-            logger.info("SummaryGen metadata saved summaryId=%s fileId=%s s3_key=%s", summary_id, summary_file_id,
-                        s3_key)
+            logger.info("SummaryGen metadata saved summaryId=%s fileId=%s s3_key=%s", summary_id, summary_file_id, s3_key)
 
             await self._publish(
                 self.rabbit.queue_summary_gen_complete,
-                {
-                    "summaryId": str(summary_id),
-                    "subjectId": subject_id,
-                    "themeId": theme_id,
-                    "status": "SUCCESS",
-                    "error": "",
-                },
+                to_payload(
+                    SummaryGenComplete(
+                        summaryId=summary_id,
+                        subjectId=subject_id,
+                        themeId=theme_id,
+                        userId=user_id,
+                        status="SUCCESS",
+                        error="",
+                    )
+                ),
             )
             logger.info("SummaryGen completed summaryId=%s status=SUCCESS", summary_id)
-
 
         except Exception as e:
             logger.exception("SummaryGen failed summaryId=%s error=%s", summary_id, e)
             await self._publish(
                 self.rabbit.queue_summary_gen_complete,
-                {
-                    "summaryId": str(summary_id),
-                    "subjectId": subject_id,
-                    "themeId": theme_id,
-                    "status": "FAILED",
-                    "error": str(e),
-                },
+                to_payload(
+                    SummaryGenComplete(
+                        summaryId=summary_id,
+                        subjectId=subject_id,
+                        themeId=theme_id,
+                        userId=user_id,
+                        status="FAILED",
+                        error=str(e),
+                    )
+                ),
             )
         finally:
-            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)
+            await asyncio.to_thread(
+                self.s3.finish_task_cache_usage,
+                s3_keys,
+                str(summary_id) if summary_id is not None else None,
+            )
 
     async def handle_quiz_gen(self, payload: dict) -> None:
         """
@@ -740,18 +841,47 @@ class TaskProcessor:
             additional_requirements: text
         }
         """
-        quiz_id = UUID(payload["quizId"])
-        file_ids = [UUID(fid) for fid in payload["files"]]
-        difficulty = payload.get("difficulty", "medium")
-        question_count = payload.get("question_count", 10)
-        raw_qtypes = payload.get("question_types") or ["multichoice", "matching", "truefalse"]
+        quiz_id = str(payload.get("quizId", ""))
+        user_id = str(payload.get("userId", ""))
+        try:
+            request = QuizGenRequest.model_validate(payload)
+        except Exception as e:
+            error_message = str(e)
+            if isinstance(e, ValidationError):
+                for error in e.errors():
+                    if tuple(error.get("loc", ())) == ("summaryId",) and error.get("type") == "missing":
+                        error_message = "Invalid QuizGen payload: required field summaryId is missing"
+                        break
+            logger.exception("QuizGen payload validation failed quizId=%s error=%s", quiz_id, error_message)
+            await self._publish(
+                self.rabbit.queue_quiz_gen_complete,
+                to_payload(
+                    QuizGenComplete(
+                        quizId=quiz_id,
+                        userId=user_id,
+                        status="FAILED",
+                        error=error_message,
+                    )
+                ),
+            )
+            return
+
+        quiz_id = request.quiz_id
+        user_id = request.user_id
+        summary_id = request.summary_id
+        file_ids = request.files
+        difficulty = request.difficulty
+        question_count = request.question_count
+        raw_qtypes = request.question_types or ["multichoice", "matching", "truefalse"]
         raw_qtypes = [str(t).lower() for t in raw_qtypes]
-        additional_req = payload.get("additional_requirements") or ""
+        additional_req = request.additional_requirements or ""
         theme_id_raw = payload.get("themeId")
         theme_id: Optional[int] = int(theme_id_raw) if theme_id_raw is not None else None
         logger.info(
-            "QuizGen started quizId=%s themeId=%s files=%d difficulty=%s question_count=%s question_types=%s additional_requirements_len=%d",
+            "QuizGen started quizId=%s userId=%s summaryId=%s themeId=%s files=%d difficulty=%s question_count=%s question_types=%s additional_requirements_len=%d",
             quiz_id,
+            user_id,
+            summary_id,
             theme_id,
             len(file_ids),
             difficulty,
@@ -798,16 +928,14 @@ class TaskProcessor:
                 theme_name = await self.db.get_theme_name(theme_id)
                 logger.info("QuizGen theme resolved quizId=%s theme=%s", quiz_id, theme_name)
 
-            # 1) s3Index → S3
-            s3_keys = await self.db.get_s3_keys_for_file_ids(file_ids)
-            logger.info("QuizGen S3 keys loaded quizId=%s count=%d", quiz_id, len(s3_keys))
-            if len(s3_keys) != len(file_ids):
-                logger.warning(
-                    "QuizGen S3 key count mismatch quizId=%s requested_files=%d found_keys=%d",
-                    quiz_id,
-                    len(file_ids),
-                    len(s3_keys),
-                )
+            file_records = await self.db.get_file_records_for_file_ids(file_ids)
+            if len(file_records) != len(file_ids):
+                found_ids = {record.file_id for record in file_records}
+                missing = [str(file_id) for file_id in file_ids if file_id not in found_ids]
+                raise RuntimeError(f"QuizGen source files not found in DB: {missing}")
+
+            s3_keys = [record.s3_index for record in file_records]
+            logger.info("QuizGen file records loaded quizId=%s count=%d", quiz_id, len(file_records))
             local_files = await self._download_s3_keys(s3_keys, work_dir, "QuizGen", quiz_id)
             logger.info("QuizGen files downloaded quizId=%s count=%d", quiz_id, len(local_files))
 
@@ -821,11 +949,12 @@ class TaskProcessor:
                     sampled_text = _sample_text(file_text, settings.quiz_source_max_chars_per_file)
                     note_text += sampled_text + "\n\n"
                     logger.info(
-                        "QuizGen text file read quizId=%s path=%s chars=%d sampled_chars=%d",
+                        "QuizGen text file read quizId=%s path=%s source_chars=%d used_chars=%d per_file_limit=%d",
                         quiz_id,
                         p,
                         len(file_text),
                         len(sampled_text),
+                        settings.quiz_source_max_chars_per_file,
                     )
                 elif p.suffix.lower() == ".pdf":
                     try:
@@ -838,11 +967,12 @@ class TaskProcessor:
                         sampled_text = _sample_text(pdf_text, settings.quiz_source_max_chars_per_file)
                         note_text += sampled_text + "\n\n"
                         logger.info(
-                            "QuizGen PDF text extracted quizId=%s path=%s chars=%d sampled_chars=%d",
+                            "QuizGen PDF text extracted quizId=%s path=%s source_chars=%d used_chars=%d per_file_limit=%d",
                             quiz_id,
                             p,
                             len(pdf_text),
                             len(sampled_text),
+                            settings.quiz_source_max_chars_per_file,
                         )
 
             if not note_text.strip():
@@ -851,12 +981,13 @@ class TaskProcessor:
                 original_chars = len(note_text)
                 note_text = _sample_text(note_text, settings.quiz_source_max_chars)
                 logger.info(
-                    "QuizGen source text sampled quizId=%s original_chars=%d sampled_chars=%d",
+                    "QuizGen source text sampled quizId=%s source_chars=%d used_chars=%d total_limit=%d",
                     quiz_id,
                     original_chars,
                     len(note_text),
+                    settings.quiz_source_max_chars,
                 )
-            logger.info("QuizGen source text ready quizId=%s chars=%d", quiz_id, len(note_text))
+            logger.info("QuizGen source text ready quizId=%s used_chars=%d", quiz_id, len(note_text))
 
             ui_counts = _distribute_question_counts(
                 total=question_count,
@@ -929,11 +1060,14 @@ class TaskProcessor:
 
             await self._publish(
                 self.rabbit.queue_quiz_gen_complete,
-                {
-                    "quizId": str(quiz_id),
-                    "status": "SUCCESS",
-                    "error": "",
-                },
+                to_payload(
+                    QuizGenComplete(
+                        quizId=quiz_id,
+                        userId=user_id,
+                        status="SUCCESS",
+                        error="",
+                    )
+                ),
             )
             logger.info("QuizGen completed quizId=%s status=SUCCESS", quiz_id)
 
@@ -942,11 +1076,14 @@ class TaskProcessor:
             logger.exception("QuizGen failed quizId=%s error=%s", quiz_id, e)
             await self._publish(
                 self.rabbit.queue_quiz_gen_complete,
-                {
-                    "quizId": str(quiz_id),
-                    "status": "FAILED",
-                    "error": str(e),
-                },
+                to_payload(
+                    QuizGenComplete(
+                        quizId=quiz_id,
+                        userId=user_id,
+                        status="FAILED",
+                        error=str(e),
+                    )
+                ),
             )
         finally:
-            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)
+            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys, str(quiz_id) if quiz_id else None)

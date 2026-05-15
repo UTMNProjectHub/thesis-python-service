@@ -27,3 +27,6 @@ class FAQGenerationConfig:
     num_questions: int = 10
     detail_level: str = "medium"
     additional_requirements: str = ""
+    batch_index: int = 1
+    batch_count: int = 1
+    avoid_questions: tuple[str, ...] = ()

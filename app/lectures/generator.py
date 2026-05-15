@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+from app.documents.chunking import estimate_tokens
 from app.documents.indexers.base import BaseRetriever
 from app.documents.models import DocumentChunk
+from app.lectures.context_selection import select_balanced_chunks
 from app.lectures.models import LecturePlan, LectureSection
 from app.lectures.planner import _build_context_from_chunks, _difficulty_comment
 from app.services.proxy_client import proxy_completion
@@ -17,6 +19,9 @@ async def generate_section_markdown(
         topic_description: Optional[str] = None,
         max_tokens: int = 900,
         top_k_chunks: int = 5,
+        retrieval_pool_k: int | None = None,
+        context_token_budget: int | None = None,
+        additional_requirements: str = "",
 ) -> str:
     """
     Генерирует текст ОДНОЙ секции лекции в формате Markdown.
@@ -38,17 +43,23 @@ async def generate_section_markdown(
         query_parts.append(" ".join(section.key_points))
     if topic_description:
         query_parts.append(topic_description)
+    if additional_requirements:
+        query_parts.append(additional_requirements)
 
     query = " ".join(query_parts).strip()
 
-    chunk_results: List[Tuple[DocumentChunk, float]] = retriever.search(
+    chunk_results: List[Tuple[DocumentChunk, float]] = select_balanced_chunks(
+        retriever,
         query,
-        top_k=top_k_chunks,
+        pool_k=retrieval_pool_k or top_k_chunks,
+        limit=top_k_chunks,
+        token_budget=context_token_budget,
     )
 
     context_text = _build_context_from_chunks(
         chunk_results,
-        max_chars_per_chunk=1000,
+        max_chars_per_chunk=None,
+        token_budget=context_token_budget,
     ) if chunk_results else ""
 
     difficulty_hint = _difficulty_comment(plan.difficulty)
@@ -66,6 +77,7 @@ async def generate_section_markdown(
         "- раскрывай key_points в связный текст, а не просто копируй их списком,\n"
         "- при необходимости можно добавлять списки, таблицы, примеры кода и фрагменты SQL,\n"
         "- опирайся на переданные фрагменты контекста, но переформулируй своими словами,\n"
+        "- не добавляй ссылки на источники, идентификаторы F1/F2, S3-пути или номера страниц,\n"
         "- объём — ориентировочно 1–3 печатные страницы в зависимости от сложности.\n"
     )
 
@@ -94,6 +106,11 @@ async def generate_section_markdown(
         parts.append("Ключевые тезисы, которые нужно раскрыть в этой секции:")
         for kp in section.key_points:
             parts.append(f"- {kp}")
+        parts.append("")
+
+    if additional_requirements.strip():
+        parts.append("Дополнительные требования к лекции:")
+        parts.append(additional_requirements.strip())
         parts.append("")
 
     parts.append("Целевой уровень сложности:")
@@ -128,6 +145,58 @@ async def generate_section_markdown(
     return raw_text.strip()
 
 
+async def polish_lecture_markdown(
+        markdown: str,
+        plan: LecturePlan,
+        *,
+        additional_requirements: str = "",
+        input_token_budget: int = 50_000,
+) -> str:
+    if not markdown.strip():
+        return markdown
+
+    if estimate_tokens(markdown) > input_token_budget:
+        sections = markdown.split("\n## ")
+        if len(sections) <= 1:
+            return markdown
+        polished_parts = [sections[0].strip()]
+        for raw_section in sections[1:]:
+            section_md = "## " + raw_section.strip()
+            polished_parts.append(
+                await polish_lecture_markdown(
+                    section_md,
+                    plan,
+                    additional_requirements=additional_requirements,
+                    input_token_budget=input_token_budget,
+                )
+            )
+        return "\n\n".join(part for part in polished_parts if part.strip()).strip()
+
+    system_prompt = (
+        "You are an academic Russian lecture editor. Improve coherence, remove repeated ideas, "
+        "smooth transitions, and fix contradictions. Preserve Markdown structure and technical meaning. "
+        "Do not add citations, source links, fragment ids like F1/F2, S3 paths, or page references."
+    )
+    user_prompt = "\n".join(
+        part
+        for part in [
+            f"Lecture title: {plan.topic_title}",
+            f"Additional requirements: {additional_requirements}" if additional_requirements.strip() else "",
+            "Return only the edited Markdown.",
+        ]
+        if part
+    )
+    max_tokens = min(12_000, max(2500, int(estimate_tokens(markdown) * 1.15)))
+    edited, _ = await proxy_completion(
+        text=markdown,
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        temperature=0.2,
+        max_tokens=max_tokens,
+    )
+    return edited.strip() or markdown
+
+
 async def generate_lecture_markdown(
         plan: LecturePlan,
         retriever: BaseRetriever,
@@ -135,6 +204,11 @@ async def generate_lecture_markdown(
         topic_description: Optional[str] = None,
         max_tokens_per_section: int = 900,
         top_k_chunks_per_section: int = 5,
+        retrieval_pool_k: int | None = None,
+        context_token_budget: int | None = None,
+        additional_requirements: str = "",
+        final_edit_enabled: bool = False,
+        final_edit_input_token_budget: int = 50_000,
 ) -> str:
     """
     Генерирует ПОЛНЫЙ Markdown-конспект лекции по плану.
@@ -163,13 +237,6 @@ async def generate_lecture_markdown(
         lines.append(f"## {section.title}")
         lines.append("")
 
-        # (опционально) явно выводим ключевые тезисы перед текстом
-        if section.key_points:
-            lines.append("**Ключевые тезисы секции:**")
-            for kp in section.key_points:
-                lines.append(f"- {kp}")
-            lines.append("")
-
         # Генерируем текст секции
         section_md = await generate_section_markdown(
             plan=plan,
@@ -178,9 +245,20 @@ async def generate_lecture_markdown(
             topic_description=topic_description,
             max_tokens=max_tokens_per_section,
             top_k_chunks=top_k_chunks_per_section,
+            retrieval_pool_k=retrieval_pool_k,
+            context_token_budget=context_token_budget,
+            additional_requirements=additional_requirements,
         )
 
         lines.append(section_md)
         lines.append("")  # пустая строка-разделитель
 
-    return "\n".join(lines).strip()
+    markdown = "\n".join(lines).strip()
+    if final_edit_enabled:
+        return await polish_lecture_markdown(
+            markdown,
+            plan,
+            additional_requirements=additional_requirements,
+            input_token_budget=final_edit_input_token_budget,
+        )
+    return markdown
