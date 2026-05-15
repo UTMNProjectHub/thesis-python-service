@@ -291,6 +291,52 @@ class Settings(BaseSettings):
         default=30_000,
         validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_BUSY_TIMEOUT_MS", "document_index_cache_busy_timeout_ms"),
     )
+    quiz_answer_dialog_summary_message_limit: int = Field(
+        default=30,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_MESSAGE_LIMIT",
+            "quiz_answer_dialog_summary_message_limit",
+        ),
+    )
+    quiz_answer_dialog_top_k_chunks: int = Field(
+        default=6,
+        validation_alias=AliasChoices("QUIZ_ANSWER_DIALOG_TOP_K_CHUNKS", "quiz_answer_dialog_top_k_chunks"),
+    )
+    quiz_answer_dialog_context_token_budget: int = Field(
+        default=6000,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_CONTEXT_TOKEN_BUDGET",
+            "quiz_answer_dialog_context_token_budget",
+        ),
+    )
+    quiz_answer_dialog_max_response_tokens: int = Field(
+        default=700,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_MAX_RESPONSE_TOKENS",
+            "quiz_answer_dialog_max_response_tokens",
+        ),
+    )
+    quiz_answer_dialog_lock_timeout_seconds: float = Field(
+        default=300.0,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_LOCK_TIMEOUT_SECONDS",
+            "quiz_answer_dialog_lock_timeout_seconds",
+        ),
+    )
+    quiz_answer_dialog_summary_cache_db_path: str = Field(
+        default="files_materials/_quiz_answer_dialog_cache/summaries.sqlite3",
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_CACHE_DB_PATH",
+            "quiz_answer_dialog_summary_cache_db_path",
+        ),
+    )
+    quiz_answer_dialog_summary_cache_busy_timeout_ms: int = Field(
+        default=30_000,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_CACHE_BUSY_TIMEOUT_MS",
+            "quiz_answer_dialog_summary_cache_busy_timeout_ms",
+        ),
+    )
     pdf_font_regular: str = Field(
         default="",
         validation_alias=AliasChoices("PDF_FONT_REGULAR", "pdf_font_regular"),

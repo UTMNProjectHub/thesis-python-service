@@ -86,5 +86,18 @@ class SummaryGenComplete(RabbitContractModel):
     error: str = ""
 
 
+class QuizAnswerDialogRequest(RabbitContractModel):
+    dialog_id: UUID = Field(alias="dialogId")
+    user_id: UUID = Field(alias="userId")
+    message_id: UUID = Field(alias="messageId")
+
+
+class QuizAnswerDialogResponse(RabbitContractModel):
+    status: TaskStatus
+    dialog_id: UUID | str = Field(alias="dialogId")
+    user_id: UUID | str = Field(alias="userId")
+    error: str | None = None
+
+
 def to_payload(model: RabbitContractModel) -> dict:
     return model.model_dump(by_alias=True, mode="json")
