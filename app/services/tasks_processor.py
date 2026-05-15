@@ -69,6 +69,65 @@ from app.utils.pdf_utils import extract_text_from_pdf
 
 logger = logging.getLogger(__name__)
 
+QUIZ_ANSWER_DIALOG_SYSTEM_PROMPT = """
+Ты — помошник преподователя. Тебя зовут "Ассистентус". Ты помогаешь студенту разобраться с конкретным вопросом теста после ответа.
+Тебя создали студенты 4 курса МОиАИС Тюменского государственного университета в 2026 году.
+
+Твоя задача:
+- отвечать только на последний вопрос студента;
+- объяснять смысл правильного ответа и причину ошибки, если она есть;
+- использовать факты в таком приоритете: данные вопроса и проверенного ответа из системы, затем объяснение системы, затем RAG-фрагменты учебных материалов, затем история диалога;
+- не придумывать факты, которых нет в контексте;
+- если данных недостаточно, прямо скажи, чего именно не хватает, и дай максимально полезное объяснение на основе доступного контекста;
+- не пересказывай всю историю диалога;
+- не спорь с результатом проверки ответа из системы;
+- если студент ошибся, сначала спокойно объясни ошибку, затем покажи правильную логику;
+- если студент прав, подтверди это и углуби понимание темы;
+- если вопрос студента не связан с текущим quiz question, кратко ответь на вопрос и мягко верни ответ к теме вопроса.
+- если студент спрашивает, кто тебя создал, скажи им, что тебя создали студенты 4 курса МОиАИС Тюменского государственного университета в 2026 году.
+- если студент спрашивает, как тебя зовут, скажи, что ты - "Ассистентус" помошник по учёбе.
+
+Стиль:
+- русский язык;
+- кратко, но содержательно;
+- тон доброжелательного преподавателя;
+- 1-4 абзаца;
+- списки используй только если это реально делает объяснение понятнее.
+""".strip()
+
+QUIZ_ANSWER_DIALOG_USER_PROMPT = """
+Сгенерируй ответ ассистента на текущий вопрос студента.
+Ответ должен помочь понять правильность ответа и связанную тему без повторения всей истории.
+Не добавляй технические ссылки, source anchors, fileId, page references или внутренние fragment/chunk ids.
+""".strip()
+
+QUIZ_ANSWER_DIALOG_SUMMARY_SYSTEM_PROMPT = """
+Ты готовишь структурное резюме старой части диалога для преподавателя, который продолжит отвечать студенту.
+Не добавляй новых фактов и не меняй смысл сказанного.
+Сохраняй только то, что поможет ответить на следующий вопрос студента.
+""".strip()
+
+QUIZ_ANSWER_DIALOG_SUMMARY_USER_PROMPT = """
+Сожми этот фрагмент диалога на русском в структуре:
+
+Факты, уже объясненные студенту:
+- ...
+
+Ошибки или непонимания студента:
+- ...
+
+Уже решенные вопросы:
+- ...
+
+Открытые уточнения:
+- ...
+
+Последняя позиция ассистента:
+- ...
+
+Если какой-то раздел пуст, напиши "нет".
+""".strip()
+
 UI_TO_INTERNAL: dict[str, QuestionType] = {
     "truefalse": "true_false",
     "multichoice": "multiple_choice",
@@ -155,6 +214,18 @@ def json_dumps_safe(value: object, max_chars: int) -> str:
 
 
 FAQ_DETAIL_LEVELS = {"easy", "medium", "hard"}
+
+
+def _display_title(value: object, fallback: str) -> str:
+    title = str(value or "").strip()
+    return title or fallback
+
+
+def _lecture_title_for_theme(theme_name: object, theme_id: int | None = None) -> str:
+    theme = str(theme_name or "").strip()
+    if not theme or theme.lower() == "none":
+        theme = str(theme_id) if theme_id is not None else "без названия"
+    return f"Лекция по теме {theme}"
 
 
 @dataclass
@@ -485,32 +556,32 @@ class TaskProcessor:
     @staticmethod
     def _format_variant(variant: QuizAnswerDialogVariant) -> str:
         parts = [
-            f"- text: {variant.text or ''}",
-            f"correct: {TaskProcessor._bool_ru(variant.is_right)}",
+            f"- текст: {variant.text or ''}",
+            f"правильный: {TaskProcessor._bool_ru(variant.is_right)}",
         ]
         if variant.left_matching or variant.right_matching:
-            parts.append(f"matching: {variant.left_matching or ''} -> {variant.right_matching or ''}")
+            parts.append(f"соответствие: {variant.left_matching or ''} -> {variant.right_matching or ''}")
         if variant.explain_right:
-            parts.append(f"explainRight: {variant.explain_right}")
+            parts.append(f"объяснение если верно: {variant.explain_right}")
         if variant.explain_wrong:
-            parts.append(f"explainWrong: {variant.explain_wrong}")
+            parts.append(f"объяснение если неверно: {variant.explain_wrong}")
         return "; ".join(parts)
 
     @staticmethod
     def _format_chosen_answer(answer: QuizAnswerDialogChosenAnswer) -> str:
-        parts = [f"- isRight: {TaskProcessor._bool_ru(answer.is_right)}"]
+        parts = [f"- ответ засчитан как правильный: {TaskProcessor._bool_ru(answer.is_right)}"]
         if answer.answer:
-            parts.append(f"answer: {answer.answer}")
+            parts.append(f"текстовый ответ: {answer.answer}")
         if answer.variant_text:
-            parts.append(f"chosen variant: {answer.variant_text}")
+            parts.append(f"выбранный вариант: {answer.variant_text}")
         if answer.answer_left or answer.answer_right:
-            parts.append(f"matching answer: {answer.answer_left or ''} -> {answer.answer_right or ''}")
+            parts.append(f"ответ на соответствие: {answer.answer_left or ''} -> {answer.answer_right or ''}")
         if answer.explanation:
-            parts.append(f"system explanation: {answer.explanation}")
+            parts.append(f"объяснение системы: {answer.explanation}")
         if answer.is_right is True and answer.explain_right:
-            parts.append(f"right explanation: {answer.explain_right}")
+            parts.append(f"почему верно: {answer.explain_right}")
         if answer.is_right is False and answer.explain_wrong:
-            parts.append(f"wrong explanation: {answer.explain_wrong}")
+            parts.append(f"почему неверно: {answer.explain_wrong}")
         return "; ".join(parts)
 
     @staticmethod
@@ -533,6 +604,64 @@ class TaskProcessor:
         return "\n\n".join(result).strip()
 
     @staticmethod
+    def _clip_text_to_token_budget(text: str, token_budget: int) -> str:
+        clean = text.strip()
+        if not clean:
+            return ""
+        max_chars = max(1, token_budget * 4)
+        if len(clean) <= max_chars:
+            return clean
+        return clean[:max_chars].rstrip()
+
+    @staticmethod
+    def _effective_quiz_answer_dialog_context_budget() -> int:
+        model_available = (
+            settings.model_context_window_tokens
+            - settings.reserved_output_tokens
+            - settings.prompt_overhead_tokens
+        )
+        return max(1000, min(settings.quiz_answer_dialog_context_token_budget, model_available))
+
+    @staticmethod
+    def _quiz_answer_dialog_rag_budget(total_budget: int) -> int:
+        if total_budget <= 0:
+            return 0
+        requested = max(settings.quiz_answer_dialog_rag_min_token_budget, total_budget // 3)
+        return min(requested, max(1, total_budget // 2))
+
+    @staticmethod
+    def _build_quiz_answer_dialog_generation_context(
+            *,
+            base_context: str,
+            rag_context: str,
+            history_context: str,
+            total_budget: int,
+    ) -> str:
+        prompt_label_budget = min(500, max(0, total_budget // 20))
+        content_budget = max(1, total_budget - prompt_label_budget)
+        rag_budget = TaskProcessor._quiz_answer_dialog_rag_budget(content_budget) if rag_context else 0
+        base_budget = max(1, min(content_budget // 3, content_budget - rag_budget))
+        remaining_after_base_rag = max(0, content_budget - base_budget - rag_budget)
+        history_budget = remaining_after_base_rag if history_context else 0
+
+        blocks = [
+            TaskProcessor._clip_text_to_token_budget(base_context, base_budget),
+            (
+                "Учебные фрагменты из материалов:\n"
+                + TaskProcessor._clip_text_to_token_budget(rag_context, rag_budget)
+                if rag_context
+                else ""
+            ),
+            (
+                "История диалога:\n"
+                + TaskProcessor._clip_text_to_token_budget(history_context, history_budget)
+                if history_context
+                else ""
+            ),
+        ]
+        return TaskProcessor._join_with_token_budget(blocks, total_budget)
+
+    @staticmethod
     def _messages_to_text(messages: list[QuizAnswerDialogMessage]) -> str:
         return "\n".join(TaskProcessor._format_dialog_message(message) for message in messages)
 
@@ -543,35 +672,38 @@ class TaskProcessor:
             snapshot = json_dumps_safe(context.context_snapshot, max_chars=4000)
 
         blocks = [
-            "Question context:",
-            f"questionId: {context.question_id}",
-            f"quizId: {context.quiz_id}",
-            f"sessionId: {context.session_id}",
-            f"question type: {context.question_type}",
-            f"question text: {context.question_text}",
-            f"user answer is correct: {TaskProcessor._bool_ru(context.submission_is_right)}",
+            "Контекст вопроса квиза:",
+            f"Тип вопроса: {context.question_type}",
+            f"Текст вопроса: {context.question_text}",
+            f"Проверенный результат ответа студента: {TaskProcessor._bool_ru(context.submission_is_right)}",
         ]
         if context.question_multi_answer is not None:
-            blocks.append(f"multi answer: {TaskProcessor._bool_ru(context.question_multi_answer)}")
+            blocks.append(f"Вопрос допускает несколько ответов: {TaskProcessor._bool_ru(context.question_multi_answer)}")
         if context.variants:
-            blocks.append("Answer variants:\n" + "\n".join(TaskProcessor._format_variant(v) for v in context.variants))
+            blocks.append("Варианты ответа:\n" + "\n".join(TaskProcessor._format_variant(v) for v in context.variants))
         if context.chosen_answers:
             blocks.append(
-                "User submitted answer and system explanation:\n"
+                "Ответ студента и объяснение системы:\n"
                 + "\n".join(TaskProcessor._format_chosen_answer(a) for a in context.chosen_answers)
             )
         if snapshot:
-            blocks.append("Context snapshot:\n" + snapshot)
-        blocks.append("Current user question:\n" + context.current_message.content)
+            blocks.append("Снимок контекста проверки:\n" + snapshot)
+        blocks.append("Текущий вопрос студента:\n" + context.current_message.content)
         return "\n\n".join(block for block in blocks if block).strip()
 
     async def _build_quiz_answer_dialog_history_context(
             self,
             messages: list[QuizAnswerDialogMessage],
+            current_message_id: UUID | None = None,
     ) -> tuple[str, int, int]:
+        if current_message_id is not None:
+            messages = [message for message in messages if message.message_id != current_message_id]
+
         limit = max(1, settings.quiz_answer_dialog_summary_message_limit)
+        if not messages:
+            return "", 0, 0
         if len(messages) <= limit:
-            return self._messages_to_text(messages), 0, 0
+            return "Последние сообщения диалога:\n" + self._messages_to_text(messages), 0, 0
 
         old_messages = messages[:-limit]
         recent_messages = messages[-limit:]
@@ -600,14 +732,10 @@ class TaskProcessor:
 
             raw_summary, _ = await proxy_completion(
                 text=self._messages_to_text(chunk),
-                user_prompt=(
-                    "Сжато перескажи этот фрагмент диалога на русском. "
-                    "Сохрани факты, вопросы пользователя, ответы системы и нерешенные уточнения. "
-                    "Не добавляй новых фактов."
-                ),
-                system_prompt="Ты сжимаешь историю диалога для следующего ответа ассистента.",
+                user_prompt=QUIZ_ANSWER_DIALOG_SUMMARY_USER_PROMPT,
+                system_prompt=QUIZ_ANSWER_DIALOG_SUMMARY_SYSTEM_PROMPT,
                 temperature=0.2,
-                max_tokens=500,
+                max_tokens=700,
             )
             summary = raw_summary.strip() or self._messages_to_text(chunk)[:2000]
             stored = await asyncio.to_thread(
@@ -623,7 +751,7 @@ class TaskProcessor:
             )
             summaries.append(f"Summary for messages {stored.sequence_start}-{stored.sequence_end}:\n{stored.summary}")
 
-        recent = "Recent dialog messages:\n" + self._messages_to_text(recent_messages)
+        recent = "Последние сообщения диалога:\n" + self._messages_to_text(recent_messages)
         history = "\n\n".join(summaries + [recent]).strip()
         return history, cache_hits, chunk_count
 
@@ -774,12 +902,13 @@ class TaskProcessor:
             max(1, settings.quiz_answer_dialog_top_k_chunks),
         )
         blocks = [
-            f"RAG fragment {idx}:\n{chunk.text}"
+            f"Учебный фрагмент {idx}:\n{chunk.text}"
             for idx, (chunk, _score) in enumerate(results, start=1)
         ]
+        effective_budget = self._effective_quiz_answer_dialog_context_budget()
         rag_context = self._join_with_token_budget(
             blocks,
-            max(1000, settings.quiz_answer_dialog_context_token_budget // 2),
+            self._quiz_answer_dialog_rag_budget(effective_budget),
         )
         logger.info(
             "QuizAnswerDialog RAG context ready dialogId=%s source_files=%d total_chunks=%d selected_chunks=%d context_tokens_est=%d",
@@ -848,7 +977,8 @@ class TaskProcessor:
 
                 base_context = self._build_quiz_answer_dialog_base_context(context)
                 history_context, summary_cache_hits, summary_chunks = await self._build_quiz_answer_dialog_history_context(
-                    context.messages
+                    context.messages,
+                    current_message_id=context.current_message.message_id,
                 )
 
                 rag_context = ""
@@ -866,31 +996,18 @@ class TaskProcessor:
                         rag_exc,
                     )
 
-                prompt_blocks = [
-                    base_context,
-                    "Dialog history:\n" + history_context if history_context else "",
-                    "RAG context:\n" + rag_context if rag_context else "",
-                ]
-                generation_context = self._join_with_token_budget(
-                    [block for block in prompt_blocks if block],
-                    settings.quiz_answer_dialog_context_token_budget,
+                effective_context_budget = self._effective_quiz_answer_dialog_context_budget()
+                generation_context = self._build_quiz_answer_dialog_generation_context(
+                    base_context=base_context,
+                    rag_context=rag_context,
+                    history_context=history_context,
+                    total_budget=effective_context_budget,
                 )
 
-                system_prompt = (
-                    "Ты отвечаешь студенту в диалоге по конкретному вопросу квиза. "
-                    "Отвечай на русском, кратко и по делу. "
-                    "Опирайся на контекст вопроса, ответ пользователя, объяснение системы, историю диалога и RAG-фрагменты. "
-                    "Не добавляй ссылки на источники, fileId, page references или внутренние fragment ids. "
-                    "Если данных недостаточно, честно скажи, чего не хватает, и дай максимально полезное объяснение."
-                )
-                user_prompt = (
-                    "Сгенерируй ответ ассистента на последний вопрос пользователя. "
-                    "Ответ должен помогать понять правильность ответа и связанную тему, без повторения всей истории."
-                )
                 raw_answer, model = await proxy_completion(
                     text=generation_context,
-                    user_prompt=user_prompt,
-                    system_prompt=system_prompt,
+                    user_prompt=QUIZ_ANSWER_DIALOG_USER_PROMPT,
+                    system_prompt=QUIZ_ANSWER_DIALOG_SYSTEM_PROMPT,
                     temperature=0.2,
                     max_tokens=settings.quiz_answer_dialog_max_response_tokens,
                 )
@@ -908,6 +1025,8 @@ class TaskProcessor:
                         "usedSummaryCache": summary_cache_hits > 0,
                         "summaryCacheHits": summary_cache_hits,
                         "summaryChunks": summary_chunks,
+                        "effectiveContextBudget": effective_context_budget,
+                        "contextTokensEstimate": estimate_tokens(generation_context),
                         "model": model,
                     },
                 )
@@ -1200,7 +1319,7 @@ class TaskProcessor:
             response_faq_id = str(faq_id)
             response_user_id = str(user_id)
 
-            title = str(payload.get("title") or "").strip() or f"FAQ {summary_id}"
+            title = _display_title(payload.get("title"), f"FAQ {summary_id}")
             num_questions = int(payload.get("numQuestions", 10))
             if num_questions <= 0:
                 raise ValueError("numQuestions must be greater than 0")
@@ -1263,7 +1382,7 @@ class TaskProcessor:
             await asyncio.to_thread(markdown_to_pdf, md_path, pdf_path)
             logger.info("FAQGen PDF exported faqId=%s path=%s", faq_id, pdf_path)
 
-            file_name = f"faq_{faq_id}.pdf"
+            file_name = title
             s3_key = await asyncio.to_thread(
                 self.s3.upload_file_to_bucket,
                 local_path=str(pdf_path),
@@ -1356,8 +1475,14 @@ class TaskProcessor:
             logger.info("SummaryGen work dir prepared summaryId=%s path=%s", summary_id, work_dir)
 
             theme = await self.db.get_theme_name(theme_id)
-            theme_name: str = str(theme)
-            logger.info("SummaryGen theme resolved summaryId=%s theme=%s", summary_id, theme_name)
+            theme_name = _display_title(theme, str(theme_id))
+            lecture_title = _lecture_title_for_theme(theme_name, theme_id)
+            logger.info(
+                "SummaryGen theme resolved summaryId=%s theme=%s lecture_title=%s",
+                summary_id,
+                theme_name,
+                lecture_title,
+            )
 
             summary_file_id = uuid4()
             file_records = await self.db.get_file_records_for_file_ids(file_ids)
@@ -1517,8 +1642,8 @@ class TaskProcessor:
 
             topic = LectureTopic(
                 id=str(summary_file_id),
-                title=f"Авто-конспект по теме {theme_name}",
-                description="Автоматически сгенерированный конспект.",
+                title=lecture_title,
+                description="Автоматически сгенерированная лекция.",
                 difficulty=DifficultyLevel.MEDIUM,
                 keywords=[],
                 duration_min=90,
@@ -1576,7 +1701,7 @@ class TaskProcessor:
             await asyncio.to_thread(markdown_to_pdf, summary_path, pdf_path)
             logger.info("SummaryGen PDF exported summaryId=%s path=%s", summary_id, pdf_path)
 
-            file_name = "auto conspect on theme.pdf"
+            file_name = lecture_title
             s3_key = await asyncio.to_thread(
                 self.s3.upload_file_to_bucket,
                 local_path=str(pdf_path),

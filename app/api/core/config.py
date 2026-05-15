@@ -303,10 +303,29 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("QUIZ_ANSWER_DIALOG_TOP_K_CHUNKS", "quiz_answer_dialog_top_k_chunks"),
     )
     quiz_answer_dialog_context_token_budget: int = Field(
-        default=6000,
+        default=24_000,
         validation_alias=AliasChoices(
             "QUIZ_ANSWER_DIALOG_CONTEXT_TOKEN_BUDGET",
             "quiz_answer_dialog_context_token_budget",
+        ),
+    )
+    model_context_window_tokens: int = Field(
+        default=128_000,
+        validation_alias=AliasChoices("MODEL_CONTEXT_WINDOW_TOKENS", "model_context_window_tokens"),
+    )
+    reserved_output_tokens: int = Field(
+        default=8_000,
+        validation_alias=AliasChoices("RESERVED_OUTPUT_TOKENS", "reserved_output_tokens"),
+    )
+    prompt_overhead_tokens: int = Field(
+        default=2_000,
+        validation_alias=AliasChoices("PROMPT_OVERHEAD_TOKENS", "prompt_overhead_tokens"),
+    )
+    quiz_answer_dialog_rag_min_token_budget: int = Field(
+        default=6_000,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_RAG_MIN_TOKEN_BUDGET",
+            "quiz_answer_dialog_rag_min_token_budget",
         ),
     )
     quiz_answer_dialog_max_response_tokens: int = Field(

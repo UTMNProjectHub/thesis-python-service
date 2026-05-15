@@ -583,29 +583,10 @@ class PostgresClient:
             dialog_row["questionId"],
         )
         if not chosen_rows:
-            chosen_rows = await pool.fetch(
-                """
-                SELECT
-                    cv.id AS "submitId",
-                    cv."chosenId",
-                    cv.answer,
-                    cv."answerLeft",
-                    cv."answerRight",
-                    cv."isRight",
-                    cv.explanation,
-                    qv."isRight" AS "variantIsRight",
-                    v.text AS "variantText",
-                    v."explainRight",
-                    v."explainWrong",
-                    v."leftMatching",
-                    v."rightMatching"
-                FROM thesis.chosen_variants cv
-                LEFT JOIN thesis.questions_variants qv ON qv.id = cv."chosenId"
-                LEFT JOIN thesis.variants v ON v.id = qv."variantId"
-                WHERE cv."quizId" = $1
-                  AND cv."questionId" = $2
-                ORDER BY cv.id
-                """,
+            logger.warning(
+                "Postgres quiz answer dialog has no chosen answers scoped to session dialogId=%s sessionId=%s quizId=%s questionId=%s",
+                dialog_id,
+                dialog_row["sessionId"],
                 dialog_row["quizId"],
                 dialog_row["questionId"],
             )
@@ -832,12 +813,13 @@ class PostgresClient:
 
         summary_row = await pool.fetchrow(
             """
-            INSERT INTO thesis.summaries("subjectId", "themeId", "fileId")
-            VALUES ($1, $2, $3) RETURNING id
+            INSERT INTO thesis.summaries("subjectId", "themeId", "fileId", name)
+            VALUES ($1, $2, $3, $4) RETURNING id
             """,
             subject_id,
             theme_id,
             summary_id,
+            file_name,
         )
         summary_db_id: int = summary_row["id"]
         logger.info("Postgres summary row inserted summaryDbId=%s fileId=%s", summary_db_id, summary_id)

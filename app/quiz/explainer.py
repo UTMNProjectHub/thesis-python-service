@@ -7,6 +7,40 @@ from app.quiz.models import QuizQuestion, AnswerVariant, QuestionType
 from app.quiz.rag import SimpleVectorStore
 from app.services.proxy_client import proxy_completion
 
+QUIZ_EXPLANATION_SYSTEM_PROMPT = """
+Ты — доброжелательный преподаватель, который объясняет результат ответа студента.
+
+Твоя задача:
+- опираться на текст вопроса, варианты, правильный ответ, ответ студента и учебный контекст;
+- если ответ верный, кратко подтвердить и объяснить, почему он верный;
+- если ответ неверный, объяснить ошибку без резкости и показать правильную логику;
+- не выдумывать дополнительный материал;
+- не показывать source ids, chunk ids, file ids или технические ссылки;
+- отвечать на русском языке;
+- держать объяснение коротким: обычно 2-5 предложений.
+""".strip()
+
+
+def _format_variants_for_prompt(question: QuizQuestion) -> str:
+    variants = question.variants or []
+    if not variants:
+        return "нет вариантов"
+    return "\n".join(
+        f"- {variant.text} | правильный: {'да' if variant.is_correct else 'нет'}"
+        for variant in variants
+    )
+
+
+def _format_correct_answer_for_prompt(question: QuizQuestion) -> str:
+    if question.variants:
+        correct = [variant.text for variant in question.variants if variant.is_correct]
+        return "; ".join(correct) if correct else "не указан"
+    if question.matching_pairs:
+        return "; ".join(f"{pair.left_option} -> {pair.right_option}" for pair in question.matching_pairs)
+    if isinstance(question.correct_answer, list):
+        return "; ".join(question.correct_answer)
+    return str(question.correct_answer or "не указан")
+
 
 async def generate_explanations(
         question: QuizQuestion,
@@ -22,13 +56,21 @@ async def generate_explanations(
     context = "\n\n".join(context_chunks[:5]) if context_chunks else ""
 
     base_prompt = f"""
-    Ты — преподаватель. Объясняй просто и по делу.
-    Контекст из лекции:
-    {context}
-    
-    Вопрос: {question.text}
-    Тип: {question.type}
-    """
+Учебный контекст:
+{context}
+
+Вопрос:
+{question.text}
+
+Тип:
+{question.type}
+
+Все варианты ответа:
+{_format_variants_for_prompt(question)}
+
+Правильный ответ:
+{_format_correct_answer_for_prompt(question)}
+"""
 
     difficulty_hint = {
         "easy": "Объясняй как для новичка, с примерами.",
@@ -65,21 +107,23 @@ async def _explain_variant(
 ) -> str:
     if variant.is_correct:
         user_prompt = f"""
-        Правильный вариант: "{variant.text}"
-        
-        Напиши подтверждение (2–4 предложения), почему верно.
-        {difficulty_hint}
-        Начинай с "Верно", "Правильно".
-        """
+Вариант для объяснения: "{variant.text}"
+Результат: вариант правильный.
+
+Напиши подтверждение, почему этот вариант верный.
+{difficulty_hint}
+Начинай с "Верно" или "Правильно".
+"""
     else:
         user_prompt = f"""
-        Неправильный вариант: "{variant.text}"
-        
-        Объясни, почему неверно, и укажи правильный.
-        {difficulty_hint}
-        Начинай с "Неверно", "Ошибка".
-        Максимум 4 предложения.
-        """
+Вариант для объяснения: "{variant.text}"
+Результат: вариант неправильный.
+
+Объясни, почему этот вариант неверен, и покажи правильную логику.
+{difficulty_hint}
+Начинай с "Неверно" или "Ошибка".
+Максимум 5 предложений.
+"""
 
     # Специально для True/False
     if question_type == "true_false":
@@ -91,7 +135,7 @@ async def _explain_variant(
     explanation, _ = await proxy_completion(
         text="",
         user_prompt=base_prompt + "\n" + user_prompt,
-        system_prompt="Ты — доброжелательный преподаватель.",
+        system_prompt=QUIZ_EXPLANATION_SYSTEM_PROMPT,
         temperature=0.3,
         max_tokens=200,
     )
@@ -105,17 +149,17 @@ async def _explain_general_correct(
 ) -> str:
     ans_str = correct_answer if isinstance(correct_answer, str) else ", ".join(correct_answer or [])
     user_prompt = f"""
-    Правильный ответ: "{ans_str}"
-    
-    Напиши объяснение (3–5 предложений), почему это правильно.
-    {difficulty_hint}
-    Начинай с "Правильный ответ потому что...".
-    """
+Правильный ответ: "{ans_str}"
+
+Напиши объяснение, почему этот ответ правильный.
+{difficulty_hint}
+Начинай с "Правильный ответ потому что...".
+"""
 
     explanation, _ = await proxy_completion(
         text="",
         user_prompt=base_prompt + "\n" + user_prompt,
-        system_prompt="Ты — доброжелательный преподаватель.",
+        system_prompt=QUIZ_EXPLANATION_SYSTEM_PROMPT,
         temperature=0.3,
         max_tokens=300,
     )
@@ -146,21 +190,23 @@ async def _explain_variant_via_proxy(base_prompt: str, variant_text: str, is_cor
                                      question_type: str, difficulty_hint: str) -> str:
     if is_correct:
         user = f'''
-    Правильный вариант: "{variant_text}"
-    
-    Напиши подтверждение (2–4 предложения), почему верно.
-    {difficulty_hint}
-    Начинай с "Верно", "Правильно".
-    '''
+Вариант для объяснения: "{variant_text}"
+Результат: вариант правильный.
+
+Напиши подтверждение, почему этот вариант верный.
+{difficulty_hint}
+Начинай с "Верно" или "Правильно".
+'''
     else:
         user = f'''
-    Неправильный вариант: "{variant_text}"
-    
-    Объясни, почему неверно, и укажи правильный.
-    {difficulty_hint}
-    Начинай с "Неверно", "Ошибка".
-    Максимум 4 предложения.
-    '''
+Вариант для объяснения: "{variant_text}"
+Результат: вариант неправильный.
+
+Объясни, почему этот вариант неверен, и покажи правильную логику.
+{difficulty_hint}
+Начинай с "Неверно" или "Ошибка".
+Максимум 5 предложений.
+'''
 
     if question_type == "true_false":
         if variant_text.strip().lower() in ("true", "верно", "да"):
@@ -171,7 +217,7 @@ async def _explain_variant_via_proxy(base_prompt: str, variant_text: str, is_cor
     explanation, _ = await proxy_completion(
         text="",
         user_prompt=base_prompt + "\n" + user,
-        system_prompt="Ты — доброжелательный преподаватель.",
+        system_prompt=QUIZ_EXPLANATION_SYSTEM_PROMPT,
         temperature=0.3,
         max_tokens=200,
     )
@@ -183,17 +229,17 @@ async def _explain_general_via_proxy(base_prompt: str, correct_answer, difficult
     ans_str = correct_answer if isinstance(correct_answer, str) else ", ".join(correct_answer or [])
 
     user = f'''
-    Правильный ответ: "{ans_str}"
-    
-    Напиши объяснение (3–5 предложений), почему это правильно.
-    {difficulty_hint}
-    Начинай с "Правильный ответ потому что...".
-    '''
+Правильный ответ: "{ans_str}"
+
+Напиши объяснение, почему этот ответ правильный.
+{difficulty_hint}
+Начинай с "Правильный ответ потому что...".
+'''
 
     explanation, _ = await proxy_completion(
         text="",
         user_prompt=base_prompt + "\n" + user,
-        system_prompt="Ты — доброжелательный преподаватель.",
+        system_prompt=QUIZ_EXPLANATION_SYSTEM_PROMPT,
         temperature=0.3,
         max_tokens=300,
     )
@@ -217,13 +263,21 @@ async def generate_all_explanations_async(
         context = "\n\n".join(chunks[:5]) if chunks else ""
 
         base_prompt = f"""
-        Ты — преподаватель. Объясняй просто и по делу.
-        Контекст из лекции:
-        {context}
-        
-        Вопрос: {question.text}
-        Тип: {question.type}
-        """
+Учебный контекст:
+{context}
+
+Вопрос:
+{question.text}
+
+Тип:
+{question.type}
+
+Все варианты ответа:
+{_format_variants_for_prompt(question)}
+
+Правильный ответ:
+{_format_correct_answer_for_prompt(question)}
+"""
 
         variants = question.variants or []
 
