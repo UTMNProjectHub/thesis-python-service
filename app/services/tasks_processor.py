@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import random
 import time
@@ -15,10 +16,11 @@ from pydantic import ValidationError
 
 from app.api.core.config import settings
 from app.curriculum.models import LectureTopic, DifficultyLevel
-from app.documents.chunking import chunk_document_pages
+from app.documents.chunking import chunk_document_pages, estimate_tokens
 from app.documents.docx_reader import extract_docx_text
 from app.documents.index_cache import DocumentIndexCache, DocumentIndexData
 from app.documents.indexers import EmbeddingsRetriever, HybridRetriever, TfidfRetriever
+from app.documents.models import Document
 from app.documents.pdf_reader import load_pdf_document
 from app.faq import FAQGenerationConfig, format_faq_as_markdown, generate_faq_from_text
 from app.lectures.context_policy import build_context_policy
@@ -40,8 +42,17 @@ from app.quiz.models import (
     QuestionType
 )
 from app.quiz.rag import SimpleVectorStore
-from app.services.postgres import PostgresClient
+from app.services.postgres import (
+    FileRecord,
+    PostgresClient,
+    QuizAnswerDialogChosenAnswer,
+    QuizAnswerDialogContext,
+    QuizAnswerDialogMessage,
+    QuizAnswerDialogVariant,
+)
 from app.services.contracts import (
+    QuizAnswerDialogRequest,
+    QuizAnswerDialogResponse,
     QuizGenComplete,
     QuizGenRequest,
     SummaryGenComplete,
@@ -49,6 +60,8 @@ from app.services.contracts import (
     to_payload,
 )
 from app.services.embeddings_client import OpenAIEmbeddingsClient
+from app.services.proxy_client import proxy_completion
+from app.services.quiz_answer_dialog_summary_cache import QuizAnswerDialogSummaryCache
 from app.services.rabbitmq import RabbitClient
 from app.services.s3_client import S3Client
 from app.utils.md_to_pdf import markdown_to_pdf
@@ -129,6 +142,16 @@ def _sample_text(text: str, max_chars: int) -> str:
             text[-part:],
         ]
     )
+
+
+def json_dumps_safe(value: object, max_chars: int) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value)
+    if len(text) > max_chars:
+        return text[:max_chars].rstrip() + "..."
+    return text
 
 
 FAQ_DETAIL_LEVELS = {"easy", "medium", "hard"}
@@ -350,6 +373,77 @@ class TaskProcessor:
         )
 
     @staticmethod
+    def _build_text_document_index(
+            file_path: Path,
+            file_id: str,
+            file_name: str | None,
+            chunk_tokens: int,
+            embedding_model: str,
+    ) -> DocumentIndexData:
+        started = time.perf_counter()
+        text = _extract_source_text(file_path)
+        doc = Document(
+            id=file_id,
+            path=file_path,
+            title=file_name or file_path.name,
+            pages=1,
+        )
+        chunks = chunk_document_pages(doc, [text], max_tokens=chunk_tokens)
+        chunked_at = time.perf_counter()
+        embedding_chunks = EmbeddingsRetriever.prepare_embedding_chunks(chunks, max_tokens=chunk_tokens)
+        if embedding_chunks:
+            embeddings_client = OpenAIEmbeddingsClient(model=embedding_model)
+            embeddings = np.asarray(
+                embeddings_client.embed_texts([chunk.text for chunk in embedding_chunks]),
+                dtype="float32",
+            )
+        else:
+            embeddings = np.empty((0, 0), dtype="float32")
+
+        embedded_at = time.perf_counter()
+        logger.info(
+            "Document text index built path=%s fileId=%s chunks=%d embedding_chunks=%d read_chunk_seconds=%.3f embedding_seconds=%.3f total_seconds=%.3f",
+            file_path,
+            file_id,
+            len(chunks),
+            len(embedding_chunks),
+            chunked_at - started,
+            embedded_at - chunked_at,
+            embedded_at - started,
+        )
+        return DocumentIndexData(
+            document=doc,
+            chunks=chunks,
+            embedding_chunks=embedding_chunks,
+            embeddings=embeddings,
+        )
+
+    @classmethod
+    def _build_source_document_index(
+            cls,
+            file_path: Path,
+            file_id: str,
+            file_name: str | None,
+            chunk_tokens: int,
+            embedding_model: str,
+    ) -> DocumentIndexData:
+        if file_path.suffix.lower() == ".pdf":
+            return cls._build_pdf_document_index(
+                file_path,
+                file_id,
+                file_name,
+                chunk_tokens,
+                embedding_model,
+            )
+        return cls._build_text_document_index(
+            file_path,
+            file_id,
+            file_name,
+            chunk_tokens,
+            embedding_model,
+        )
+
+    @staticmethod
     def _build_summary_retriever(
             all_chunks: list,
             embedding_chunks: list | None = None,
@@ -375,6 +469,486 @@ class TaskProcessor:
         result = self.rabbit.publish(queue, payload)
         if inspect.isawaitable(result):
             await result
+
+    @staticmethod
+    def _bool_ru(value: bool | None) -> str:
+        if value is True:
+            return "да"
+        if value is False:
+            return "нет"
+        return "неизвестно"
+
+    @staticmethod
+    def _format_dialog_message(message: QuizAnswerDialogMessage) -> str:
+        return f"[{message.sequence_no}] {message.role}: {message.content}".strip()
+
+    @staticmethod
+    def _format_variant(variant: QuizAnswerDialogVariant) -> str:
+        parts = [
+            f"- text: {variant.text or ''}",
+            f"correct: {TaskProcessor._bool_ru(variant.is_right)}",
+        ]
+        if variant.left_matching or variant.right_matching:
+            parts.append(f"matching: {variant.left_matching or ''} -> {variant.right_matching or ''}")
+        if variant.explain_right:
+            parts.append(f"explainRight: {variant.explain_right}")
+        if variant.explain_wrong:
+            parts.append(f"explainWrong: {variant.explain_wrong}")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _format_chosen_answer(answer: QuizAnswerDialogChosenAnswer) -> str:
+        parts = [f"- isRight: {TaskProcessor._bool_ru(answer.is_right)}"]
+        if answer.answer:
+            parts.append(f"answer: {answer.answer}")
+        if answer.variant_text:
+            parts.append(f"chosen variant: {answer.variant_text}")
+        if answer.answer_left or answer.answer_right:
+            parts.append(f"matching answer: {answer.answer_left or ''} -> {answer.answer_right or ''}")
+        if answer.explanation:
+            parts.append(f"system explanation: {answer.explanation}")
+        if answer.is_right is True and answer.explain_right:
+            parts.append(f"right explanation: {answer.explain_right}")
+        if answer.is_right is False and answer.explain_wrong:
+            parts.append(f"wrong explanation: {answer.explain_wrong}")
+        return "; ".join(parts)
+
+    @staticmethod
+    def _join_with_token_budget(blocks: list[str], token_budget: int) -> str:
+        max_chars = max(1000, token_budget * 4)
+        result: list[str] = []
+        used = 0
+        for block in blocks:
+            clean = block.strip()
+            if not clean:
+                continue
+            next_len = len(clean) + 2
+            if result and used + next_len > max_chars:
+                break
+            if not result and next_len > max_chars:
+                result.append(clean[:max_chars].strip())
+                break
+            result.append(clean)
+            used += next_len
+        return "\n\n".join(result).strip()
+
+    @staticmethod
+    def _messages_to_text(messages: list[QuizAnswerDialogMessage]) -> str:
+        return "\n".join(TaskProcessor._format_dialog_message(message) for message in messages)
+
+    @staticmethod
+    def _build_quiz_answer_dialog_base_context(context: QuizAnswerDialogContext) -> str:
+        snapshot = ""
+        if context.context_snapshot:
+            snapshot = json_dumps_safe(context.context_snapshot, max_chars=4000)
+
+        blocks = [
+            "Question context:",
+            f"questionId: {context.question_id}",
+            f"quizId: {context.quiz_id}",
+            f"sessionId: {context.session_id}",
+            f"question type: {context.question_type}",
+            f"question text: {context.question_text}",
+            f"user answer is correct: {TaskProcessor._bool_ru(context.submission_is_right)}",
+        ]
+        if context.question_multi_answer is not None:
+            blocks.append(f"multi answer: {TaskProcessor._bool_ru(context.question_multi_answer)}")
+        if context.variants:
+            blocks.append("Answer variants:\n" + "\n".join(TaskProcessor._format_variant(v) for v in context.variants))
+        if context.chosen_answers:
+            blocks.append(
+                "User submitted answer and system explanation:\n"
+                + "\n".join(TaskProcessor._format_chosen_answer(a) for a in context.chosen_answers)
+            )
+        if snapshot:
+            blocks.append("Context snapshot:\n" + snapshot)
+        blocks.append("Current user question:\n" + context.current_message.content)
+        return "\n\n".join(block for block in blocks if block).strip()
+
+    async def _build_quiz_answer_dialog_history_context(
+            self,
+            messages: list[QuizAnswerDialogMessage],
+    ) -> tuple[str, int, int]:
+        limit = max(1, settings.quiz_answer_dialog_summary_message_limit)
+        if len(messages) <= limit:
+            return self._messages_to_text(messages), 0, 0
+
+        old_messages = messages[:-limit]
+        recent_messages = messages[-limit:]
+        cache = QuizAnswerDialogSummaryCache()
+        summaries: list[str] = []
+        cache_hits = 0
+        chunk_count = 0
+
+        for start in range(0, len(old_messages), limit):
+            chunk = old_messages[start:start + limit]
+            if not chunk:
+                continue
+            chunk_count += 1
+            cache_key, content_hash, sequence_start, sequence_end, message_count = cache.build_cache_key(
+                dialog_id=str(chunk[0].dialog_id),
+                messages=chunk,
+                model=settings.model,
+            )
+            cached = await asyncio.to_thread(cache.get, cache_key)
+            if cached is not None:
+                cache_hits += 1
+                summaries.append(
+                    f"Summary for messages {cached.sequence_start}-{cached.sequence_end}:\n{cached.summary}"
+                )
+                continue
+
+            raw_summary, _ = await proxy_completion(
+                text=self._messages_to_text(chunk),
+                user_prompt=(
+                    "Сжато перескажи этот фрагмент диалога на русском. "
+                    "Сохрани факты, вопросы пользователя, ответы системы и нерешенные уточнения. "
+                    "Не добавляй новых фактов."
+                ),
+                system_prompt="Ты сжимаешь историю диалога для следующего ответа ассистента.",
+                temperature=0.2,
+                max_tokens=500,
+            )
+            summary = raw_summary.strip() or self._messages_to_text(chunk)[:2000]
+            stored = await asyncio.to_thread(
+                cache.set,
+                cache_key=cache_key,
+                dialog_id=str(chunk[0].dialog_id),
+                content_hash=content_hash,
+                sequence_start=sequence_start,
+                sequence_end=sequence_end,
+                message_count=message_count,
+                model=settings.model,
+                summary=summary,
+            )
+            summaries.append(f"Summary for messages {stored.sequence_start}-{stored.sequence_end}:\n{stored.summary}")
+
+        recent = "Recent dialog messages:\n" + self._messages_to_text(recent_messages)
+        history = "\n\n".join(summaries + [recent]).strip()
+        return history, cache_hits, chunk_count
+
+    async def _resolve_quiz_answer_dialog_rag_records(
+            self,
+            context: QuizAnswerDialogContext,
+    ) -> list[FileRecord]:
+        records: list[FileRecord] = []
+        if context.reference_file_ids:
+            file_ids = _dedupe_file_ids(context.reference_file_ids)
+            records = await self.db.get_file_records_for_file_ids(file_ids)
+            if len(records) != len(file_ids):
+                found_ids = {record.file_id for record in records}
+                missing = [str(file_id) for file_id in file_ids if file_id not in found_ids]
+                logger.warning(
+                    "QuizAnswerDialog missing referenced file records dialogId=%s missing=%s",
+                    context.dialog_id,
+                    missing,
+                )
+
+        if not records and context.summary_file_record is not None:
+            records = [context.summary_file_record]
+            logger.info(
+                "QuizAnswerDialog RAG fallback to summary file dialogId=%s fileId=%s",
+                context.dialog_id,
+                context.summary_file_record.file_id,
+            )
+
+        deduped: list[FileRecord] = []
+        seen: set[UUID] = set()
+        for record in records:
+            if record.file_id in seen:
+                continue
+            seen.add(record.file_id)
+            deduped.append(record)
+        return deduped
+
+    async def _build_quiz_answer_dialog_rag_context(
+            self,
+            context: QuizAnswerDialogContext,
+            work_dir: Path,
+            used_s3_keys: list[str] | None = None,
+    ) -> tuple[str, int, list[str]]:
+        records = await self._resolve_quiz_answer_dialog_rag_records(context)
+        if not records:
+            logger.warning("QuizAnswerDialog RAG has no source records dialogId=%s", context.dialog_id)
+            return "", 0, []
+
+        s3_keys = [record.s3_index for record in records]
+        if used_s3_keys is not None:
+            used_s3_keys.extend(s3_keys)
+        local_files = await self._download_s3_keys(s3_keys, work_dir, "QuizAnswerDialog", context.dialog_id)
+        document_index_cache = DocumentIndexCache() if settings.document_index_cache_enabled else None
+        all_chunks = []
+        all_embedding_chunks = []
+        embedding_arrays = []
+
+        for record, local_file in zip(records, local_files):
+            path = Path(local_file)
+            if path.suffix.lower() not in (".pdf", ".md", ".markdown", ".txt", ".docx"):
+                logger.warning(
+                    "QuizAnswerDialog skipped unsupported RAG file dialogId=%s fileId=%s path=%s",
+                    context.dialog_id,
+                    record.file_id,
+                    path,
+                )
+                continue
+
+            if document_index_cache is not None:
+                cache_entry = await asyncio.to_thread(
+                    document_index_cache.get_or_build,
+                    file_path=path,
+                    file_id=str(record.file_id),
+                    file_name=record.name,
+                    s3_index=record.s3_index,
+                    chunk_tokens=settings.lecture_chunk_tokens,
+                    embedding_model=settings.embedding_model,
+                    builder=lambda path=path, record=record: self._build_source_document_index(
+                        path,
+                        str(record.file_id),
+                        record.name,
+                        settings.lecture_chunk_tokens,
+                        settings.embedding_model,
+                    ),
+                )
+                chunks = cache_entry.chunks
+                all_embedding_chunks.extend(cache_entry.embedding_chunks)
+                if cache_entry.embeddings.shape[0] > 0:
+                    embedding_arrays.append(cache_entry.embeddings)
+                logger.info(
+                    "QuizAnswerDialog RAG index ready dialogId=%s fileId=%s chunks=%d embedding_chunks=%d cache_hit=%s",
+                    context.dialog_id,
+                    record.file_id,
+                    len(chunks),
+                    len(cache_entry.embedding_chunks),
+                    cache_entry.cache_hit,
+                )
+            else:
+                data = await asyncio.to_thread(
+                    self._build_source_document_index,
+                    path,
+                    str(record.file_id),
+                    record.name,
+                    settings.lecture_chunk_tokens,
+                    settings.embedding_model,
+                )
+                chunks = data.chunks
+                all_embedding_chunks.extend(data.embedding_chunks)
+                if data.embeddings.shape[0] > 0:
+                    embedding_arrays.append(data.embeddings)
+
+            all_chunks.extend(chunks)
+
+        if not all_chunks:
+            logger.warning("QuizAnswerDialog RAG extracted no chunks dialogId=%s", context.dialog_id)
+            return "", 0, s3_keys
+
+        all_embeddings = np.vstack(embedding_arrays) if embedding_arrays else np.empty((0, 0), dtype="float32")
+        if all_embeddings.shape[0] == len(all_embedding_chunks):
+            retriever = await asyncio.to_thread(
+                self._build_summary_retriever,
+                all_chunks,
+                all_embedding_chunks,
+                all_embeddings,
+            )
+        else:
+            logger.warning(
+                "QuizAnswerDialog cached embeddings mismatch dialogId=%s chunks=%d embeddings=%d; rebuilding retriever",
+                context.dialog_id,
+                len(all_embedding_chunks),
+                all_embeddings.shape[0],
+            )
+            retriever = await asyncio.to_thread(self._build_summary_retriever, all_chunks)
+        query_parts = [
+            context.question_text,
+            context.current_message.content,
+            " ".join(
+                part
+                for answer in context.chosen_answers
+                for part in [answer.answer, answer.variant_text, answer.answer_left, answer.answer_right]
+                if part
+            ),
+        ]
+        query = "\n".join(part for part in query_parts if part).strip()
+        results = await asyncio.to_thread(
+            retriever.search,
+            query,
+            max(1, settings.quiz_answer_dialog_top_k_chunks),
+        )
+        blocks = [
+            f"RAG fragment {idx}:\n{chunk.text}"
+            for idx, (chunk, _score) in enumerate(results, start=1)
+        ]
+        rag_context = self._join_with_token_budget(
+            blocks,
+            max(1000, settings.quiz_answer_dialog_context_token_budget // 2),
+        )
+        logger.info(
+            "QuizAnswerDialog RAG context ready dialogId=%s source_files=%d total_chunks=%d selected_chunks=%d context_tokens_est=%d",
+            context.dialog_id,
+            len(records),
+            len(all_chunks),
+            len(results),
+            estimate_tokens(rag_context) if rag_context else 0,
+        )
+        return rag_context, len(results), s3_keys
+
+    async def handle_quiz_answer_dialog(self, payload: dict) -> None:
+        dialog_id_raw = str(payload.get("dialogId", ""))
+        user_id_raw = str(payload.get("userId", ""))
+        message_id_raw = str(payload.get("messageId", ""))
+        response_queue = getattr(self.rabbit, "queue_quiz_answer_dialog_response", "quiz.answer.dialog.response")
+        s3_keys: list[str] = []
+
+        try:
+            request = QuizAnswerDialogRequest.model_validate(payload)
+        except Exception as exc:
+            logger.exception(
+                "QuizAnswerDialog payload validation failed dialogId=%s userId=%s messageId=%s error=%s",
+                dialog_id_raw,
+                user_id_raw,
+                message_id_raw,
+                exc,
+            )
+            await self._publish(
+                response_queue,
+                to_payload(
+                    QuizAnswerDialogResponse(
+                        dialogId=dialog_id_raw,
+                        userId=user_id_raw,
+                        status="FAILED",
+                        error=f"Invalid QuizAnswerDialog payload: {exc}",
+                    )
+                ),
+            )
+            return
+
+        dialog_id = request.dialog_id
+        user_id = request.user_id
+        message_id = request.message_id
+
+        try:
+            logger.info(
+                "QuizAnswerDialog started dialogId=%s userId=%s messageId=%s",
+                dialog_id,
+                user_id,
+                message_id,
+            )
+            work_dir = self._work_dir("quiz_answer_dialog", dialog_id)
+
+            async with self.db.quiz_answer_dialog_lock(
+                dialog_id,
+                settings.quiz_answer_dialog_lock_timeout_seconds,
+            ):
+                context = await self.db.get_quiz_answer_dialog_context(
+                    dialog_id=dialog_id,
+                    user_id=user_id,
+                    message_id=message_id,
+                )
+                if context is None:
+                    raise RuntimeError("Dialog/message not found or userId mismatch")
+
+                base_context = self._build_quiz_answer_dialog_base_context(context)
+                history_context, summary_cache_hits, summary_chunks = await self._build_quiz_answer_dialog_history_context(
+                    context.messages
+                )
+
+                rag_context = ""
+                rag_chunk_count = 0
+                try:
+                    rag_context, rag_chunk_count, _ = await self._build_quiz_answer_dialog_rag_context(
+                        context,
+                        work_dir,
+                        used_s3_keys=s3_keys,
+                    )
+                except Exception as rag_exc:
+                    logger.exception(
+                        "QuizAnswerDialog RAG fallback to DB context dialogId=%s error=%s",
+                        dialog_id,
+                        rag_exc,
+                    )
+
+                prompt_blocks = [
+                    base_context,
+                    "Dialog history:\n" + history_context if history_context else "",
+                    "RAG context:\n" + rag_context if rag_context else "",
+                ]
+                generation_context = self._join_with_token_budget(
+                    [block for block in prompt_blocks if block],
+                    settings.quiz_answer_dialog_context_token_budget,
+                )
+
+                system_prompt = (
+                    "Ты отвечаешь студенту в диалоге по конкретному вопросу квиза. "
+                    "Отвечай на русском, кратко и по делу. "
+                    "Опирайся на контекст вопроса, ответ пользователя, объяснение системы, историю диалога и RAG-фрагменты. "
+                    "Не добавляй ссылки на источники, fileId, page references или внутренние fragment ids. "
+                    "Если данных недостаточно, честно скажи, чего не хватает, и дай максимально полезное объяснение."
+                )
+                user_prompt = (
+                    "Сгенерируй ответ ассистента на последний вопрос пользователя. "
+                    "Ответ должен помогать понять правильность ответа и связанную тему, без повторения всей истории."
+                )
+                raw_answer, model = await proxy_completion(
+                    text=generation_context,
+                    user_prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    temperature=0.2,
+                    max_tokens=settings.quiz_answer_dialog_max_response_tokens,
+                )
+                answer = raw_answer.strip()
+                if not answer:
+                    raise RuntimeError("Quiz answer dialog generation returned empty answer")
+
+                assistant_message = await self.db.insert_quiz_answer_dialog_assistant_message(
+                    dialog_id=dialog_id,
+                    user_id=user_id,
+                    content=answer,
+                    metadata={
+                        "sourceMessageId": str(message_id),
+                        "ragChunkCount": rag_chunk_count,
+                        "usedSummaryCache": summary_cache_hits > 0,
+                        "summaryCacheHits": summary_cache_hits,
+                        "summaryChunks": summary_chunks,
+                        "model": model,
+                    },
+                )
+                logger.info(
+                    "QuizAnswerDialog answer persisted dialogId=%s messageId=%s assistantMessageId=%s answer_len=%d rag_chunks=%d summary_cache_hits=%d",
+                    dialog_id,
+                    message_id,
+                    assistant_message.message_id,
+                    len(answer),
+                    rag_chunk_count,
+                    summary_cache_hits,
+                )
+
+            await self._publish(
+                response_queue,
+                to_payload(
+                    QuizAnswerDialogResponse(
+                        dialogId=dialog_id,
+                        userId=user_id,
+                        status="SUCCESS",
+                        error=None,
+                    )
+                ),
+            )
+            logger.info("QuizAnswerDialog completed dialogId=%s status=SUCCESS", dialog_id)
+
+        except Exception as exc:
+            logger.exception("QuizAnswerDialog failed dialogId=%s error=%s", dialog_id, exc)
+            await self._publish(
+                response_queue,
+                to_payload(
+                    QuizAnswerDialogResponse(
+                        dialogId=dialog_id,
+                        userId=user_id,
+                        status="FAILED",
+                        error=str(exc),
+                    )
+                ),
+            )
+        finally:
+            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys, str(dialog_id))
 
     def _convert_raw_to_quiz_questions(
             self, raw_questions: List[Question],

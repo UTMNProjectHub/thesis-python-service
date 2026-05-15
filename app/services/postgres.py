@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, List, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
@@ -17,6 +19,68 @@ class FileRecord:
     file_id: UUID
     name: str
     s3_index: str
+
+
+@dataclass(frozen=True)
+class QuizAnswerDialogMessage:
+    message_id: UUID
+    dialog_id: UUID
+    user_id: UUID | None
+    role: str
+    content: str
+    sequence_no: int
+    metadata: dict[str, Any] | None
+
+
+@dataclass(frozen=True)
+class QuizAnswerDialogVariant:
+    link_id: UUID
+    variant_id: UUID | None
+    text: str | None
+    is_right: bool | None
+    explain_right: str | None
+    explain_wrong: str | None
+    left_matching: str | None
+    right_matching: str | None
+
+
+@dataclass(frozen=True)
+class QuizAnswerDialogChosenAnswer:
+    submit_id: UUID
+    chosen_id: UUID | None
+    answer: str | None
+    answer_left: str | None
+    answer_right: str | None
+    is_right: bool | None
+    explanation: str | None
+    variant_text: str | None
+    variant_is_right: bool | None
+    explain_right: str | None
+    explain_wrong: str | None
+    left_matching: str | None
+    right_matching: str | None
+
+
+@dataclass(frozen=True)
+class QuizAnswerDialogContext:
+    dialog_id: UUID
+    user_id: UUID
+    question_submission_id: UUID
+    session_id: UUID
+    quiz_id: UUID
+    question_id: UUID
+    context_snapshot: dict[str, Any]
+    question_type: str
+    question_text: str
+    question_multi_answer: bool | None
+    submission_is_right: bool | None
+    quiz_summary_id: int | None
+    summary_file_record: FileRecord | None
+    current_message: QuizAnswerDialogMessage
+    messages: list[QuizAnswerDialogMessage]
+    variants: list[QuizAnswerDialogVariant]
+    chosen_answers: list[QuizAnswerDialogChosenAnswer]
+    reference_file_ids: list[UUID]
 
 
 class PostgresClient:
@@ -37,6 +101,46 @@ class PostgresClient:
         )
         logger.info("Postgres pool connected min_size=%d max_size=%d", 1, 10)
         return self._pool
+
+    @staticmethod
+    def _json_dict(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @staticmethod
+    def _message_from_row(row: asyncpg.Record) -> QuizAnswerDialogMessage:
+        return QuizAnswerDialogMessage(
+            message_id=row["id"],
+            dialog_id=row["dialogId"],
+            user_id=row["userId"],
+            role=row["role"],
+            content=row["content"],
+            sequence_no=row["sequenceNo"],
+            metadata=PostgresClient._json_dict(row["metadata"]),
+        )
+
+    @asynccontextmanager
+    async def quiz_answer_dialog_lock(self, dialog_id: UUID, timeout_seconds: float):
+        pool = await self.connect()
+        timeout_ms = max(1, int(timeout_seconds * 1000))
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('lock_timeout', $1, true)", f"{timeout_ms}ms")
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)", str(dialog_id))
+                logger.info("Postgres quiz answer dialog lock acquired dialogId=%s", dialog_id)
+                try:
+                    yield
+                finally:
+                    logger.info("Postgres quiz answer dialog lock released dialogId=%s", dialog_id)
 
     async def get_s3_keys_for_file_ids(self, file_ids: List[UUID]) -> List[str]:
         pool = await self.connect()
@@ -339,6 +443,305 @@ class PostgresClient:
         theme_name = row["name"] if row else None
         logger.info("Postgres theme name loaded themeId=%s found=%s", theme_id, theme_name is not None)
         return theme_name
+
+    async def get_quiz_answer_dialog_context(
+            self,
+            *,
+            dialog_id: UUID,
+            user_id: UUID,
+            message_id: UUID,
+    ) -> QuizAnswerDialogContext | None:
+        pool = await self.connect()
+        logger.info(
+            "Postgres loading quiz answer dialog context dialogId=%s userId=%s messageId=%s",
+            dialog_id,
+            user_id,
+            message_id,
+        )
+        dialog_row = await pool.fetchrow(
+            """
+            SELECT
+                d.id,
+                d."questionSubmissionId",
+                d."userId",
+                d."sessionId",
+                d."quizId",
+                d."questionId",
+                d."contextSnapshot",
+                q.type AS "questionType",
+                q.text AS "questionText",
+                q."multiAnswer" AS "questionMultiAnswer",
+                qs."isRight" AS "submissionIsRight",
+                qu."summaryId" AS "quizSummaryId",
+                sf.id AS "summaryFileId",
+                sf.name AS "summaryFileName",
+                sf."s3Index" AS "summaryS3Index"
+            FROM thesis.quiz_answer_dialogs d
+            JOIN thesis.questions q ON q.id = d."questionId"
+            LEFT JOIN thesis.question_submissions qs ON qs.id = d."questionSubmissionId"
+            LEFT JOIN thesis.quizes qu ON qu.id = d."quizId"
+            LEFT JOIN thesis.summaries s ON s.id = qu."summaryId"
+            LEFT JOIN thesis.files sf ON sf.id = s."fileId"
+            WHERE d.id = $1 AND d."userId" = $2
+            """,
+            dialog_id,
+            user_id,
+        )
+        if dialog_row is None:
+            logger.warning("Postgres quiz answer dialog not found dialogId=%s userId=%s", dialog_id, user_id)
+            return None
+
+        current_row = await pool.fetchrow(
+            """
+            SELECT id, "dialogId", "userId", role, content, "sequenceNo", metadata
+            FROM thesis.quiz_answer_dialog_messages
+            WHERE id = $1 AND "dialogId" = $2 AND "userId" = $3
+            """,
+            message_id,
+            dialog_id,
+            user_id,
+        )
+        if current_row is None:
+            logger.warning(
+                "Postgres quiz answer dialog current message not found dialogId=%s userId=%s messageId=%s",
+                dialog_id,
+                user_id,
+                message_id,
+            )
+            return None
+
+        message_rows = await pool.fetch(
+            """
+            SELECT id, "dialogId", "userId", role, content, "sequenceNo", metadata
+            FROM thesis.quiz_answer_dialog_messages
+            WHERE "dialogId" = $1
+            ORDER BY "sequenceNo" ASC
+            """,
+            dialog_id,
+        )
+        messages = [self._message_from_row(row) for row in message_rows]
+
+        variant_rows = await pool.fetch(
+            """
+            SELECT
+                qv.id AS "linkId",
+                qv."variantId",
+                qv."isRight",
+                v.text,
+                v."explainRight",
+                v."explainWrong",
+                v."leftMatching",
+                v."rightMatching"
+            FROM thesis.questions_variants qv
+            LEFT JOIN thesis.variants v ON v.id = qv."variantId"
+            WHERE qv."questionId" = $1
+            ORDER BY v.text NULLS LAST, qv.id
+            """,
+            dialog_row["questionId"],
+        )
+        variants = [
+            QuizAnswerDialogVariant(
+                link_id=row["linkId"],
+                variant_id=row["variantId"],
+                text=row["text"],
+                is_right=row["isRight"],
+                explain_right=row["explainRight"],
+                explain_wrong=row["explainWrong"],
+                left_matching=row["leftMatching"],
+                right_matching=row["rightMatching"],
+            )
+            for row in variant_rows
+        ]
+
+        chosen_rows = await pool.fetch(
+            """
+            SELECT
+                cv.id AS "submitId",
+                cv."chosenId",
+                cv.answer,
+                cv."answerLeft",
+                cv."answerRight",
+                cv."isRight",
+                cv.explanation,
+                qv."isRight" AS "variantIsRight",
+                v.text AS "variantText",
+                v."explainRight",
+                v."explainWrong",
+                v."leftMatching",
+                v."rightMatching"
+            FROM thesis.session_submits ss
+            JOIN thesis.chosen_variants cv ON cv.id = ss."submitId"
+            LEFT JOIN thesis.questions_variants qv ON qv.id = cv."chosenId"
+            LEFT JOIN thesis.variants v ON v.id = qv."variantId"
+            WHERE ss."sessionId" = $1
+              AND cv."quizId" = $2
+              AND cv."questionId" = $3
+            ORDER BY cv.id
+            """,
+            dialog_row["sessionId"],
+            dialog_row["quizId"],
+            dialog_row["questionId"],
+        )
+        if not chosen_rows:
+            chosen_rows = await pool.fetch(
+                """
+                SELECT
+                    cv.id AS "submitId",
+                    cv."chosenId",
+                    cv.answer,
+                    cv."answerLeft",
+                    cv."answerRight",
+                    cv."isRight",
+                    cv.explanation,
+                    qv."isRight" AS "variantIsRight",
+                    v.text AS "variantText",
+                    v."explainRight",
+                    v."explainWrong",
+                    v."leftMatching",
+                    v."rightMatching"
+                FROM thesis.chosen_variants cv
+                LEFT JOIN thesis.questions_variants qv ON qv.id = cv."chosenId"
+                LEFT JOIN thesis.variants v ON v.id = qv."variantId"
+                WHERE cv."quizId" = $1
+                  AND cv."questionId" = $2
+                ORDER BY cv.id
+                """,
+                dialog_row["quizId"],
+                dialog_row["questionId"],
+            )
+        chosen_answers = [
+            QuizAnswerDialogChosenAnswer(
+                submit_id=row["submitId"],
+                chosen_id=row["chosenId"],
+                answer=row["answer"],
+                answer_left=row["answerLeft"],
+                answer_right=row["answerRight"],
+                is_right=row["isRight"],
+                explanation=row["explanation"],
+                variant_text=row["variantText"],
+                variant_is_right=row["variantIsRight"],
+                explain_right=row["explainRight"],
+                explain_wrong=row["explainWrong"],
+                left_matching=row["leftMatching"],
+                right_matching=row["rightMatching"],
+            )
+            for row in chosen_rows
+        ]
+
+        reference_rows = await pool.fetch(
+            """
+            SELECT "fileId"
+            FROM thesis.references_question
+            WHERE "questionId" = $1
+            ORDER BY id
+            """,
+            dialog_row["questionId"],
+        )
+        if not reference_rows:
+            reference_rows = await pool.fetch(
+                """
+                SELECT "fileId"
+                FROM thesis.references_quiz
+                WHERE "quizId" = $1
+                ORDER BY id
+                """,
+                dialog_row["quizId"],
+            )
+        reference_file_ids = [row["fileId"] for row in reference_rows]
+
+        summary_file_record = None
+        if dialog_row["summaryFileId"] and dialog_row["summaryS3Index"]:
+            summary_file_record = FileRecord(
+                file_id=dialog_row["summaryFileId"],
+                name=dialog_row["summaryFileName"] or "summary.pdf",
+                s3_index=dialog_row["summaryS3Index"],
+            )
+
+        context = QuizAnswerDialogContext(
+            dialog_id=dialog_row["id"],
+            user_id=dialog_row["userId"],
+            question_submission_id=dialog_row["questionSubmissionId"],
+            session_id=dialog_row["sessionId"],
+            quiz_id=dialog_row["quizId"],
+            question_id=dialog_row["questionId"],
+            context_snapshot=self._json_dict(dialog_row["contextSnapshot"]),
+            question_type=dialog_row["questionType"],
+            question_text=dialog_row["questionText"],
+            question_multi_answer=dialog_row["questionMultiAnswer"],
+            submission_is_right=dialog_row["submissionIsRight"],
+            quiz_summary_id=dialog_row["quizSummaryId"],
+            summary_file_record=summary_file_record,
+            current_message=self._message_from_row(current_row),
+            messages=messages,
+            variants=variants,
+            chosen_answers=chosen_answers,
+            reference_file_ids=reference_file_ids,
+        )
+        logger.info(
+            "Postgres quiz answer dialog context loaded dialogId=%s messages=%d variants=%d chosen=%d references=%d has_summary_file=%s",
+            dialog_id,
+            len(messages),
+            len(variants),
+            len(chosen_answers),
+            len(reference_file_ids),
+            summary_file_record is not None,
+        )
+        return context
+
+    async def insert_quiz_answer_dialog_assistant_message(
+            self,
+            *,
+            dialog_id: UUID,
+            user_id: UUID,
+            content: str,
+            metadata: dict[str, Any] | None = None,
+    ) -> QuizAnswerDialogMessage:
+        pool = await self.connect()
+        message_id = uuid4()
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                sequence_no = await conn.fetchval(
+                    """
+                    SELECT COALESCE(MAX("sequenceNo"), 0) + 1
+                    FROM thesis.quiz_answer_dialog_messages
+                    WHERE "dialogId" = $1
+                    """,
+                    dialog_id,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO thesis.quiz_answer_dialog_messages(
+                        id, "dialogId", "userId", role, content, "sequenceNo", metadata
+                    )
+                    VALUES ($1, $2, $3, 'assistant', $4, $5, $6::jsonb)
+                    RETURNING id, "dialogId", "userId", role, content, "sequenceNo", metadata
+                    """,
+                    message_id,
+                    dialog_id,
+                    user_id,
+                    content,
+                    sequence_no,
+                    metadata_json,
+                )
+                await conn.execute(
+                    """
+                    UPDATE thesis.quiz_answer_dialogs
+                    SET "updatedAt" = now()
+                    WHERE id = $1
+                    """,
+                    dialog_id,
+                )
+
+        result = self._message_from_row(row)
+        logger.info(
+            "Postgres quiz answer dialog assistant message inserted dialogId=%s messageId=%s sequenceNo=%d content_len=%d",
+            dialog_id,
+            result.message_id,
+            result.sequence_no,
+            len(content),
+        )
+        return result
 
     async def insert_reference_question(
             self,
