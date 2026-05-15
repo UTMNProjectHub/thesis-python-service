@@ -116,6 +116,20 @@ class Settings(BaseSettings):
         default=30_000,
         validation_alias=AliasChoices("QUIZ_SOURCE_MAX_CHARS_PER_FILE", "quiz_source_max_chars_per_file"),
     )
+    quiz_generation_use_source_documents: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "QUIZ_GENERATION_USE_SOURCE_DOCUMENTS",
+            "quiz_generation_use_source_documents",
+        ),
+    )
+    faq_generation_use_source_documents: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "FAQ_GENERATION_USE_SOURCE_DOCUMENTS",
+            "faq_generation_use_source_documents",
+        ),
+    )
     s3_download_cache_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("S3_DOWNLOAD_CACHE_ENABLED", "s3_download_cache_enabled"),
@@ -250,6 +264,32 @@ class Settings(BaseSettings):
     lecture_final_edit_input_token_budget: int = Field(
         default=50_000,
         validation_alias=AliasChoices("LECTURE_FINAL_EDIT_INPUT_TOKEN_BUDGET", "lecture_final_edit_input_token_budget"),
+    )
+    document_index_cache_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_ENABLED", "document_index_cache_enabled"),
+    )
+    document_index_cache_db_path: str = Field(
+        default="files_materials/_document_index_cache/index.sqlite3",
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_DB_PATH", "document_index_cache_db_path"),
+    )
+    document_index_cache_lock_timeout_seconds: float = Field(
+        default=900.0,
+        validation_alias=AliasChoices(
+            "DOCUMENT_INDEX_CACHE_LOCK_TIMEOUT_SECONDS",
+            "document_index_cache_lock_timeout_seconds",
+        ),
+    )
+    document_index_cache_stale_lock_seconds: float = Field(
+        default=21600.0,
+        validation_alias=AliasChoices(
+            "DOCUMENT_INDEX_CACHE_STALE_LOCK_SECONDS",
+            "document_index_cache_stale_lock_seconds",
+        ),
+    )
+    document_index_cache_busy_timeout_ms: int = Field(
+        default=30_000,
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_BUSY_TIMEOUT_MS", "document_index_cache_busy_timeout_ms"),
     )
     pdf_font_regular: str = Field(
         default="",

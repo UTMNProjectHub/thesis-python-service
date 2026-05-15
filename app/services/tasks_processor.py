@@ -4,17 +4,21 @@ import asyncio
 import inspect
 import logging
 import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4, UUID
 
+import numpy as np
 from pydantic import ValidationError
 
 from app.api.core.config import settings
 from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.documents.chunking import chunk_document_pages
 from app.documents.docx_reader import extract_docx_text
-from app.documents.indexers import HybridRetriever
+from app.documents.index_cache import DocumentIndexCache, DocumentIndexData
+from app.documents.indexers import EmbeddingsRetriever, HybridRetriever, TfidfRetriever
 from app.documents.pdf_reader import load_pdf_document
 from app.faq import FAQGenerationConfig, format_faq_as_markdown, generate_faq_from_text
 from app.lectures.context_policy import build_context_policy
@@ -44,6 +48,7 @@ from app.services.contracts import (
     SummaryGenRequest,
     to_payload,
 )
+from app.services.embeddings_client import OpenAIEmbeddingsClient
 from app.services.rabbitmq import RabbitClient
 from app.services.s3_client import S3Client
 from app.utils.md_to_pdf import markdown_to_pdf
@@ -129,7 +134,18 @@ def _sample_text(text: str, max_chars: int) -> str:
 FAQ_DETAIL_LEVELS = {"easy", "medium", "hard"}
 
 
-def _extract_faq_source_text(file_path: Path) -> str:
+@dataclass
+class LectureSource:
+    summary_id: int
+    subject_id: int | None
+    theme_id: int | None
+    source_file_id: UUID
+    s3_key: str
+    path: Path
+    text: str
+
+
+def _extract_source_text(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
     if suffix in (".md", ".markdown", ".txt"):
         text = file_path.read_text(encoding="utf-8")
@@ -142,8 +158,23 @@ def _extract_faq_source_text(file_path: Path) -> str:
 
     text = text.strip()
     if not text:
-        raise RuntimeError("FAQ source file has no text content")
+        raise RuntimeError("Source file has no text content")
     return text
+
+
+_extract_faq_source_text = _extract_source_text
+
+
+def _dedupe_file_ids(values: list[UUID | str]) -> list[UUID]:
+    seen: set[UUID] = set()
+    result: list[UUID] = []
+    for value in values:
+        file_id = value if isinstance(value, UUID) else UUID(str(value))
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        result.append(file_id)
+    return result
 
 
 class TaskProcessor:
@@ -201,6 +232,143 @@ class TaskProcessor:
             )
             local_files.append(local_file)
         return local_files
+
+    async def _load_lecture_source(
+            self,
+            summary_id: int,
+            work_dir: Path,
+            task_kind: str,
+            task_id: UUID,
+    ) -> LectureSource:
+        summary_context = await self.db.get_summary_context(summary_id)
+        if summary_context is None:
+            raise RuntimeError(f"Summary not found: {summary_id}")
+
+        theme_id = summary_context.get("themeId")
+        subject_id = summary_context.get("subjectId")
+        source_file_id_raw = summary_context.get("sourceFileId")
+        lecture_s3_key = str(summary_context.get("lectureS3Key") or "").strip()
+        if theme_id is None:
+            raise RuntimeError(f"Summary {summary_id} has no themeId")
+        if source_file_id_raw is None:
+            raise RuntimeError(f"Summary {summary_id} has no source fileId")
+        if not lecture_s3_key:
+            raise RuntimeError(f"Summary {summary_id} source file has no s3Index")
+
+        source_file_id = source_file_id_raw if isinstance(source_file_id_raw, UUID) else UUID(str(source_file_id_raw))
+        logger.info(
+            "%s lecture source resolved taskId=%s summaryId=%s subjectId=%s themeId=%s sourceFileId=%s key=%s",
+            task_kind,
+            task_id,
+            summary_id,
+            subject_id,
+            theme_id,
+            source_file_id,
+            lecture_s3_key,
+        )
+
+        local_file = await asyncio.to_thread(
+            self.s3.download_to_materials,
+            lecture_s3_key,
+            work_dir,
+            str(task_id),
+        )
+        source_path = Path(local_file)
+        logger.info("%s lecture source downloaded taskId=%s path=%s", task_kind, task_id, source_path)
+
+        source_text = await asyncio.to_thread(_extract_source_text, source_path)
+        if len(source_text) > settings.quiz_source_max_chars:
+            original_chars = len(source_text)
+            source_text = _sample_text(source_text, settings.quiz_source_max_chars)
+            logger.info(
+                "%s lecture source text sampled taskId=%s source_chars=%d used_chars=%d total_limit=%d",
+                task_kind,
+                task_id,
+                original_chars,
+                len(source_text),
+                settings.quiz_source_max_chars,
+            )
+
+        logger.info(
+            "%s lecture source text ready taskId=%s used_chars=%d",
+            task_kind,
+            task_id,
+            len(source_text),
+        )
+        return LectureSource(
+            summary_id=summary_id,
+            subject_id=int(subject_id) if subject_id is not None else None,
+            theme_id=int(theme_id) if theme_id is not None else None,
+            source_file_id=source_file_id,
+            s3_key=lecture_s3_key,
+            path=source_path,
+            text=source_text,
+        )
+
+    @staticmethod
+    def _build_pdf_document_index(
+            pdf_path: Path,
+            file_id: str,
+            file_name: str | None,
+            chunk_tokens: int,
+            embedding_model: str,
+    ) -> DocumentIndexData:
+        started = time.perf_counter()
+        doc, pages = load_pdf_document(str(pdf_path), file_id, file_name)
+        parsed_at = time.perf_counter()
+        chunks = chunk_document_pages(doc, pages, max_tokens=chunk_tokens)
+        chunked_at = time.perf_counter()
+        embedding_chunks = EmbeddingsRetriever.prepare_embedding_chunks(chunks, max_tokens=chunk_tokens)
+
+        if embedding_chunks:
+            embeddings_client = OpenAIEmbeddingsClient(model=embedding_model)
+            embeddings = np.asarray(
+                embeddings_client.embed_texts([chunk.text for chunk in embedding_chunks]),
+                dtype="float32",
+            )
+        else:
+            embeddings = np.empty((0, 0), dtype="float32")
+
+        embedded_at = time.perf_counter()
+        logger.info(
+            "Document index built path=%s fileId=%s pages=%d chunks=%d embedding_chunks=%d parse_seconds=%.3f chunk_seconds=%.3f embedding_seconds=%.3f total_seconds=%.3f",
+            pdf_path,
+            file_id,
+            doc.pages,
+            len(chunks),
+            len(embedding_chunks),
+            parsed_at - started,
+            chunked_at - parsed_at,
+            embedded_at - chunked_at,
+            embedded_at - started,
+        )
+        return DocumentIndexData(
+            document=doc,
+            chunks=chunks,
+            embedding_chunks=embedding_chunks,
+            embeddings=embeddings,
+        )
+
+    @staticmethod
+    def _build_summary_retriever(
+            all_chunks: list,
+            embedding_chunks: list | None = None,
+            embeddings: np.ndarray | None = None,
+    ) -> HybridRetriever:
+        if embedding_chunks is not None and embeddings is not None:
+            tfidf = TfidfRetriever(stop_words=None)
+            tfidf.index(all_chunks)
+            embeddings_retriever = EmbeddingsRetriever()
+            embeddings_retriever.index_precomputed(embedding_chunks, embeddings)
+            return HybridRetriever(
+                tfidf_retriever=tfidf,
+                embeddings_retriever=embeddings_retriever,
+                alpha=0.7,
+            )
+
+        retriever = HybridRetriever(alpha=0.7)
+        retriever.index(all_chunks)
+        return retriever
 
     async def _publish(self, queue: str, payload: dict) -> None:
         logger.info("Publishing task result queue=%s payload=%s", queue, payload)
@@ -478,24 +646,19 @@ class TaskProcessor:
                 len(additional_requirements),
             )
 
-            summary_context = await self.db.get_summary_context(summary_id)
-            if summary_context is None:
-                raise RuntimeError(f"Summary not found: {summary_id}")
-
-            theme_id = summary_context.get("themeId")
-            subject_id = summary_context.get("subjectId")
-            source_file_id = summary_context.get("sourceFileId")
-            expected_s3_key = str(summary_context.get("lectureS3Key") or "").strip()
-            if theme_id is None:
-                raise RuntimeError(f"Summary {summary_id} has no themeId")
-            if source_file_id is None:
-                raise RuntimeError(f"Summary {summary_id} has no source fileId")
-            if not expected_s3_key:
-                raise RuntimeError(f"Summary {summary_id} source file has no s3Index")
-
-            lecture_s3_key = expected_s3_key
-            s3_keys = [lecture_s3_key]
             work_dir = self._work_dir("faq", faq_id)
+            lecture_source = await self._load_lecture_source(summary_id, work_dir, "FAQGen", faq_id)
+            theme_id = lecture_source.theme_id
+            subject_id = lecture_source.subject_id
+            source_file_id = lecture_source.source_file_id
+            s3_keys = [lecture_source.s3_key]
+            if settings.faq_generation_use_source_documents:
+                logger.warning(
+                    "FAQ_GENERATION_USE_SOURCE_DOCUMENTS=true is not supported with current summary context; "
+                    "FAQGen will use lecture text only faqId=%s summaryId=%s",
+                    faq_id,
+                    summary_id,
+                )
             logger.info(
                 "FAQGen context resolved faqId=%s summaryId=%s subjectId=%s themeId=%s sourceFileId=%s work_dir=%s",
                 faq_id,
@@ -506,25 +669,7 @@ class TaskProcessor:
                 work_dir,
             )
 
-            local_file = await asyncio.to_thread(
-                self.s3.download_to_materials,
-                lecture_s3_key,
-                work_dir,
-                str(faq_id),
-            )
-            source_path = Path(local_file)
-            logger.info("FAQGen source downloaded faqId=%s path=%s", faq_id, source_path)
-
-            source_text = await asyncio.to_thread(_extract_faq_source_text, source_path)
-            if len(source_text) > settings.quiz_source_max_chars:
-                original_chars = len(source_text)
-                source_text = _sample_text(source_text, settings.quiz_source_max_chars)
-                logger.info(
-                    "FAQGen source text sampled faqId=%s original_chars=%d sampled_chars=%d",
-                    faq_id,
-                    original_chars,
-                    len(source_text),
-                )
+            source_text = lecture_source.text
 
             cfg = FAQGenerationConfig(
                 language="ru",
@@ -653,9 +798,21 @@ class TaskProcessor:
             local_files = await self._download_s3_keys(s3_keys, work_dir, "SummaryGen", summary_id)
             logger.info("SummaryGen files downloaded summaryId=%s count=%d", summary_id, len(local_files))
 
+            document_index_cache = DocumentIndexCache() if settings.document_index_cache_enabled else None
+            if document_index_cache is None:
+                logger.info("Document index cache disabled for SummaryGen summaryId=%s", summary_id)
+            else:
+                logger.info(
+                    "Document index cache enabled for SummaryGen summaryId=%s db_path=%s",
+                    summary_id,
+                    document_index_cache.db_path,
+                )
+
             documents = []
             chunks_by_doc = {}
             all_chunks = []
+            all_embedding_chunks = []
+            embedding_arrays = []
             for record, local_file in zip(file_records, local_files):
                 if not local_file:
                     continue
@@ -669,21 +826,61 @@ class TaskProcessor:
                     )
                     continue
 
-                doc, pages = await asyncio.to_thread(load_pdf_document, str(pdf_path), str(record.file_id), record.name)
-                chunks = await asyncio.to_thread(
-                    chunk_document_pages,
-                    doc,
-                    pages,
-                    max_tokens=settings.lecture_chunk_tokens,
-                )
-                logger.info(
-                    "SummaryGen PDF parsed summaryId=%s fileId=%s document=%s pages=%d chunks=%d",
-                    summary_id,
-                    record.file_id,
-                    doc.id,
-                    doc.pages,
-                    len(chunks),
-                )
+                if document_index_cache is not None:
+                    cache_entry = await asyncio.to_thread(
+                        document_index_cache.get_or_build,
+                        file_path=pdf_path,
+                        file_id=str(record.file_id),
+                        file_name=record.name,
+                        s3_index=record.s3_index,
+                        chunk_tokens=settings.lecture_chunk_tokens,
+                        embedding_model=settings.embedding_model,
+                        builder=lambda pdf_path=pdf_path, record=record: self._build_pdf_document_index(
+                            pdf_path,
+                            str(record.file_id),
+                            record.name,
+                            settings.lecture_chunk_tokens,
+                            settings.embedding_model,
+                        ),
+                    )
+                    doc = cache_entry.document
+                    chunks = cache_entry.chunks
+                    all_embedding_chunks.extend(cache_entry.embedding_chunks)
+                    if cache_entry.embeddings.shape[0] > 0:
+                        embedding_arrays.append(cache_entry.embeddings)
+                    logger.info(
+                        "SummaryGen PDF index ready summaryId=%s fileId=%s document=%s pages=%d chunks=%d embedding_chunks=%d cache_hit=%s",
+                        summary_id,
+                        record.file_id,
+                        doc.id,
+                        doc.pages,
+                        len(chunks),
+                        len(cache_entry.embedding_chunks),
+                        cache_entry.cache_hit,
+                    )
+                else:
+                    parsed_started = time.perf_counter()
+                    doc, pages = await asyncio.to_thread(
+                        load_pdf_document,
+                        str(pdf_path),
+                        str(record.file_id),
+                        record.name,
+                    )
+                    chunks = await asyncio.to_thread(
+                        chunk_document_pages,
+                        doc,
+                        pages,
+                        max_tokens=settings.lecture_chunk_tokens,
+                    )
+                    logger.info(
+                        "SummaryGen PDF parsed summaryId=%s fileId=%s document=%s pages=%d chunks=%d seconds=%.3f",
+                        summary_id,
+                        record.file_id,
+                        doc.id,
+                        doc.pages,
+                        len(chunks),
+                        time.perf_counter() - parsed_started,
+                    )
                 documents.append(doc)
                 chunks_by_doc[doc.id] = chunks
                 all_chunks.extend(chunks)
@@ -710,8 +907,39 @@ class TaskProcessor:
                 settings.lecture_document_profiles_enabled,
             )
 
-            retriever = HybridRetriever(alpha=0.7)
-            await asyncio.to_thread(retriever.index, all_chunks)
+            retriever_started = time.perf_counter()
+            if document_index_cache is not None:
+                all_embeddings = (
+                    np.vstack(embedding_arrays)
+                    if embedding_arrays
+                    else np.empty((0, 0), dtype="float32")
+                )
+                if all_embeddings.shape[0] != len(all_embedding_chunks):
+                    raise RuntimeError(
+                        "Cached embeddings count mismatch: "
+                        f"chunks={len(all_embedding_chunks)} embeddings={all_embeddings.shape[0]}"
+                    )
+                retriever = await asyncio.to_thread(
+                    self._build_summary_retriever,
+                    all_chunks,
+                    all_embedding_chunks,
+                    all_embeddings,
+                )
+                logger.info(
+                    "SummaryGen retriever built from document index cache summaryId=%s chunks=%d embedding_chunks=%d seconds=%.3f",
+                    summary_id,
+                    len(all_chunks),
+                    len(all_embedding_chunks),
+                    time.perf_counter() - retriever_started,
+                )
+            else:
+                retriever = await asyncio.to_thread(self._build_summary_retriever, all_chunks)
+                logger.info(
+                    "SummaryGen retriever built without document index cache summaryId=%s chunks=%d seconds=%.3f",
+                    summary_id,
+                    len(all_chunks),
+                    time.perf_counter() - retriever_started,
+                )
 
             topic = LectureTopic(
                 id=str(summary_file_id),
@@ -924,22 +1152,51 @@ class TaskProcessor:
             work_dir = self._work_dir("quiz", quiz_id)
             logger.info("QuizGen work dir prepared quizId=%s path=%s", quiz_id, work_dir)
 
+            lecture_source = await self._load_lecture_source(summary_id, work_dir, "QuizGen", quiz_id)
+            s3_keys = [lecture_source.s3_key]
+            if theme_id is None:
+                theme_id = lecture_source.theme_id
+
             if theme_id is not None:
                 theme_name = await self.db.get_theme_name(theme_id)
                 logger.info("QuizGen theme resolved quizId=%s theme=%s", quiz_id, theme_name)
 
-            file_records = await self.db.get_file_records_for_file_ids(file_ids)
-            if len(file_records) != len(file_ids):
-                found_ids = {record.file_id for record in file_records}
-                missing = [str(file_id) for file_id in file_ids if file_id not in found_ids]
-                raise RuntimeError(f"QuizGen source files not found in DB: {missing}")
+            source_mode = (
+                "lecture_and_documents"
+                if settings.quiz_generation_use_source_documents
+                else "lecture_only"
+            )
+            note_text = lecture_source.text + "\n\n"
+            reference_file_ids: list[UUID] = [lecture_source.source_file_id]
+            document_texts_used = 0
+            logger.info(
+                "QuizGen source mode quizId=%s source_mode=%s lecture_chars=%d requested_files=%d",
+                quiz_id,
+                source_mode,
+                len(lecture_source.text),
+                len(file_ids),
+            )
 
-            s3_keys = [record.s3_index for record in file_records]
-            logger.info("QuizGen file records loaded quizId=%s count=%d", quiz_id, len(file_records))
-            local_files = await self._download_s3_keys(s3_keys, work_dir, "QuizGen", quiz_id)
-            logger.info("QuizGen files downloaded quizId=%s count=%d", quiz_id, len(local_files))
+            file_records = []
+            local_files = []
+            if settings.quiz_generation_use_source_documents:
+                file_records = await self.db.get_file_records_for_file_ids(file_ids)
+                if len(file_records) != len(file_ids):
+                    found_ids = {record.file_id for record in file_records}
+                    missing = [str(file_id) for file_id in file_ids if file_id not in found_ids]
+                    raise RuntimeError(f"QuizGen source files not found in DB: {missing}")
 
-            note_text = ""
+                document_s3_keys = [record.s3_index for record in file_records]
+                s3_keys.extend(document_s3_keys)
+                logger.info("QuizGen file records loaded quizId=%s count=%d", quiz_id, len(file_records))
+                local_files = await self._download_s3_keys(document_s3_keys, work_dir, "QuizGen", quiz_id)
+                logger.info("QuizGen files downloaded quizId=%s count=%d", quiz_id, len(local_files))
+            else:
+                logger.info(
+                    "QuizGen source documents disabled quizId=%s ignored_payload_files=%d",
+                    quiz_id,
+                    len(file_ids),
+                )
             for lf in local_files:
                 if not lf:
                     continue
@@ -948,6 +1205,7 @@ class TaskProcessor:
                     file_text = await asyncio.to_thread(p.read_text, encoding="utf-8")
                     sampled_text = _sample_text(file_text, settings.quiz_source_max_chars_per_file)
                     note_text += sampled_text + "\n\n"
+                    document_texts_used += 1
                     logger.info(
                         "QuizGen text file read quizId=%s path=%s source_chars=%d used_chars=%d per_file_limit=%d",
                         quiz_id,
@@ -966,6 +1224,7 @@ class TaskProcessor:
                     if pdf_text.strip():
                         sampled_text = _sample_text(pdf_text, settings.quiz_source_max_chars_per_file)
                         note_text += sampled_text + "\n\n"
+                        document_texts_used += 1
                         logger.info(
                             "QuizGen PDF text extracted quizId=%s path=%s source_chars=%d used_chars=%d per_file_limit=%d",
                             quiz_id,
@@ -974,6 +1233,9 @@ class TaskProcessor:
                             len(sampled_text),
                             settings.quiz_source_max_chars_per_file,
                         )
+
+            if file_records:
+                reference_file_ids = _dedupe_file_ids(reference_file_ids + [record.file_id for record in file_records])
 
             if not note_text.strip():
                 raise RuntimeError("Нет текстового содержимого для генерации квиза")
@@ -987,7 +1249,14 @@ class TaskProcessor:
                     len(note_text),
                     settings.quiz_source_max_chars,
                 )
-            logger.info("QuizGen source text ready quizId=%s used_chars=%d", quiz_id, len(note_text))
+            logger.info(
+                "QuizGen source text ready quizId=%s source_mode=%s used_chars=%d document_texts_used=%d references=%d",
+                quiz_id,
+                source_mode,
+                len(note_text),
+                document_texts_used,
+                len(reference_file_ids),
+            )
 
             ui_counts = _distribute_question_counts(
                 total=question_count,
@@ -1053,7 +1322,7 @@ class TaskProcessor:
                 quiz_id=quiz_id,
                 theme_id=theme_id,
                 questions=quiz_questions,
-                file_ids=file_ids,
+                file_ids=reference_file_ids,
                 theme_name=theme_name,
             )
             logger.info("QuizGen persisted quizId=%s questions=%d", quiz_id, len(quiz_questions))
