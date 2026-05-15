@@ -22,9 +22,13 @@ def main():
     def summary_handler(payload: dict):
         asyncio.run(processor.handle_summary_gen(payload))
 
+    def faq_handler(payload: dict):
+        asyncio.run(processor.handle_faq_gen(payload))
+
     # Слушаем очереди задач (в отдельных потоках, см. реализацию listen)
     rabbit.listen(rabbit.queue_quiz_gen, quiz_handler)
     rabbit.listen(rabbit.queue_summary_gen, summary_handler)
+    rabbit.listen(rabbit.queue_faq_gen, faq_handler)
 
     print("[Worker] Rabbit listeners started")
 

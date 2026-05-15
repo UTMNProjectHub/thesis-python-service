@@ -8,17 +8,15 @@ from app.documents.chunking import chunk_document_pages
 from app.documents.docx_reader import load_docx_document
 from app.documents.pdf_reader import load_pdf_document
 from app.services.proxy_client import proxy_completion
-from .config import FAQGenerationConfig
+from .config import FAQGenerationConfig, normalize_faq_detail_level
 from .models import FAQ, FAQItem
 
 
 def _strip_code_fence(text: str) -> str:
-    """
-    Убираем ```json ... ``` вокруг ответа LLM.
-    """
     t = text.strip()
     if not t.startswith("```"):
         return t
+
     lines = t.splitlines()
     if lines and lines[0].startswith("```"):
         lines = lines[1:]
@@ -28,10 +26,6 @@ def _strip_code_fence(text: str) -> str:
 
 
 def parse_faq_from_json(raw: str) -> List[FAQItem]:
-    """
-    Парсит JSON от LLM в список FAQItem.
-    Ожидает: {"items": [{"question": "...", "answer": "...", "category": "..."}, ...]}
-    """
     cleaned = _strip_code_fence(raw)
     try:
         data = json.loads(cleaned)
@@ -49,53 +43,62 @@ def parse_faq_from_json(raw: str) -> List[FAQItem]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        q = str(item.get("question", "")).strip()
-        a = str(item.get("answer", "")).strip()
-        if not q or not a:
+        question = str(item.get("question", "")).strip()
+        answer = str(item.get("answer", "")).strip()
+        if not question or not answer:
             continue
-        cat = item.get("category")
-        faq_items.append(FAQItem(question=q, answer=a, category=cat))
+        category = item.get("category")
+        faq_items.append(FAQItem(question=question, answer=answer, category=category))
     return faq_items
 
 
-def build_faq_prompt(cfg: FAQGenerationConfig) -> str:
-    """
-    Системный и user-промпт для генерации FAQ.
-    """
+def build_faq_prompt(cfg: FAQGenerationConfig) -> tuple[str, str]:
+    detail_level = normalize_faq_detail_level(cfg.detail_level)
+    detail_hint = {
+        "low": "Краткие ответы без лишних деталей, но с сохранением смысла.",
+        "medium": "Средняя детализация: объясняй ключевые идеи и добавляй примеры там, где они полезны.",
+        "high": "Подробные ответы с пояснениями, контекстом и учебными примерами.",
+    }[detail_level]
+
     system_prompt = """
-Ты — эксперт по составлению FAQ для учебных конспектов.
-Твоя задача — по тексту конспекта создать детальный, понятный FAQ.
-Всегда используй РУССКИЙ язык.
-Возвращай результат СТРОГО в формате JSON без пояснений.
+Ты - эксперт по составлению FAQ для учебных конспектов.
+Составляй вопросы и ответы на русском языке.
+Опирайся только на переданный текст лекции или конспекта.
+Возвращай результат строго в JSON без пояснений и без Markdown.
 """.strip()
 
-    detail_hint = {
-        "low": "Краткие ответы, без примеров.",
-        "medium": "Средняя детальность, с примерами где нужно.",
-        "high": "Подробные ответы, с объяснениями и примерами.",
-    }[cfg.detail_level]
+    parts = [
+        f"По тексту ниже сгенерируй {cfg.num_questions} вопросов для FAQ.",
+        "Вопросы должны покрывать ключевые понятия, определения, практические выводы и типичные ошибки понимания.",
+        "Группируй вопросы по осмысленным категориям.",
+        f"Уровень детализации: {detail_hint}",
+    ]
 
-    user_prompt = f"""
-По тексту конспекта ниже сгенерируй {cfg.num_questions} вопросов для FAQ.
-Вопросы должны быть релевантными, охватывать ключевые аспекты.
-Группируй по категориям (например, "Общие", "Технические").
-Уровень детальности: {detail_hint}.
+    additional_requirements = (cfg.additional_requirements or "").strip()
+    if additional_requirements:
+        parts.extend(["", "Дополнительные требования:", additional_requirements])
 
-Формат JSON:
-{{
+    parts.extend(
+        [
+            "",
+            "Формат JSON:",
+            """
+{
   "items": [
-    {{
+    {
       "question": "Вопрос?",
       "answer": "Ответ.",
-      "category": "Категория"  // опционально
-    }},
-    ...
+      "category": "Категория"
+    }
   ]
-}}
+}
+""".strip(),
+            "",
+            "Текст лекции:",
+        ]
+    )
 
-Текст конспекта:
-""".strip()
-    return system_prompt, user_prompt
+    return system_prompt, "\n".join(parts)
 
 
 async def generate_faq_from_text(
@@ -103,9 +106,6 @@ async def generate_faq_from_text(
         title: str,
         cfg: Optional[FAQGenerationConfig] = None,
 ) -> FAQ:
-    """
-    Генерирует FAQ из чистого текста.
-    """
     if cfg is None:
         cfg = FAQGenerationConfig()
 
@@ -117,7 +117,7 @@ async def generate_faq_from_text(
         user_prompt=full_user_prompt,
         system_prompt=system_prompt,
         temperature=0.4,
-        max_tokens=2000,
+        max_tokens=2500,
     )
 
     items = parse_faq_from_json(raw_answer)
@@ -129,9 +129,6 @@ async def generate_faq_from_file(
         title: Optional[str] = None,
         cfg: Optional[FAQGenerationConfig] = None,
 ) -> FAQ:
-    """
-    Генерирует FAQ из файла (MD, PDF, DOCX).
-    """
     p = Path(file_path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
@@ -139,14 +136,15 @@ async def generate_faq_from_file(
     if title is None:
         title = p.stem
 
-    if p.suffix.lower() == ".pdf":
+    suffix = p.suffix.lower()
+    if suffix == ".pdf":
         doc, pages_text = load_pdf_document(file_path, doc_id=title)
         chunks = chunk_document_pages(doc, pages_text)
-        text = "\n\n".join([c.text for c in chunks])  # Склеиваем чанки
-    elif p.suffix.lower() == ".docx":
-        doc, pages_text = load_docx_document(file_path, doc_id=title)
+        text = "\n\n".join(chunk.text for chunk in chunks)
+    elif suffix == ".docx":
+        _, pages_text = load_docx_document(file_path, doc_id=title)
         text = "\n\n".join(pages_text)
-    elif p.suffix.lower() in {".md", ".markdown"}:
+    elif suffix in {".md", ".markdown", ".txt"}:
         text = p.read_text(encoding="utf-8")
     else:
         raise ValueError(f"Unsupported file type: {p.suffix}")
@@ -155,24 +153,24 @@ async def generate_faq_from_file(
 
 
 def format_faq_as_markdown(faq: FAQ) -> str:
-    """
-    Форматирует FAQ в красивый Markdown.
-    """
-    lines = [f"# {faq.title}"]
-    lines.append("")
+    lines = [f"# {faq.title}", ""]
 
-    # Группировка по категориям
     categories: dict[str, List[FAQItem]] = {}
     for item in faq.items:
-        cat = item.category or "Общие вопросы"
-        categories.setdefault(cat, []).append(item)
+        category = str(item.category or "Общие вопросы").strip() or "Общие вопросы"
+        categories.setdefault(category, []).append(item)
 
-    for cat, items in categories.items():
-        lines.append(f"## {cat}")
-        lines.append("")
-        for item in items:
-            lines.append(f"**{item.question}**")
-            lines.append(item.answer)
-            lines.append("")
+    for category, items in categories.items():
+        lines.extend([f"## {category}", ""])
+        for index, item in enumerate(items, start=1):
+            question = item.question.rstrip("?")
+            lines.extend(
+                [
+                    f"### {index}. {question}?",
+                    "",
+                    item.answer.strip(),
+                    "",
+                ]
+            )
 
     return "\n".join(lines).strip()

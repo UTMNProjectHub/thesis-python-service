@@ -11,8 +11,10 @@ from uuid import uuid4, UUID
 from app.api.core.config import settings
 from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.documents.chunking import chunk_document_pages
+from app.documents.docx_reader import extract_docx_text
 from app.documents.indexers import HybridRetriever
 from app.documents.pdf_reader import load_pdf_document
+from app.faq import FAQGenerationConfig, format_faq_as_markdown, generate_faq_from_text
 from app.lectures import build_lecture_plan_for_topic, generate_lecture_markdown
 from app.quiz.explainer import generate_explanations
 from app.quiz.generation import QuizGenerationConfig, generate_quiz_from_text
@@ -111,6 +113,26 @@ def _sample_text(text: str, max_chars: int) -> str:
             text[-part:],
         ]
     )
+
+
+FAQ_DETAIL_LEVELS = {"easy", "medium", "hard"}
+
+
+def _extract_faq_source_text(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    if suffix in (".md", ".markdown", ".txt"):
+        text = file_path.read_text(encoding="utf-8")
+    elif suffix == ".pdf":
+        text = extract_text_from_pdf(str(file_path))
+    elif suffix == ".docx":
+        text = extract_docx_text(file_path)
+    else:
+        raise RuntimeError(f"Unsupported FAQ source file type: {suffix}")
+
+    text = text.strip()
+    if not text:
+        raise RuntimeError("FAQ source file has no text content")
+    return text
 
 
 class TaskProcessor:
@@ -393,6 +415,162 @@ class TaskProcessor:
                 question_id=q_db_id,
             )
         logger.info("Quiz persisted quizId=%s", quiz_id)
+
+    async def handle_faq_gen(self, payload: dict) -> None:
+        """
+        FAQGen:
+        {
+            summaryId: int,
+            faqId: uuid,
+            userId: uuid,
+            title: str,
+            numQuestions: int,
+            detailLevel: "easy"|"medium"|"hard",
+            additionalRequirements: text
+        }
+        """
+        faq_id: UUID | None = None
+        user_id: UUID | None = None
+        response_faq_id = str(payload.get("faqId", ""))
+        response_user_id = str(payload.get("userId", ""))
+        s3_keys: List[str] = []
+
+        try:
+            summary_id = int(payload["summaryId"])
+            faq_id = UUID(str(payload["faqId"]))
+            user_id = UUID(str(payload["userId"]))
+            response_faq_id = str(faq_id)
+            response_user_id = str(user_id)
+
+            title = str(payload.get("title") or "").strip() or f"FAQ {summary_id}"
+            num_questions = int(payload.get("numQuestions", 10))
+            if num_questions <= 0:
+                raise ValueError("numQuestions must be greater than 0")
+
+            detail_level = str(payload.get("detailLevel", "medium")).strip().lower()
+            if detail_level not in FAQ_DETAIL_LEVELS:
+                raise ValueError("detailLevel must be one of: easy, medium, hard")
+
+            additional_requirements = str(payload.get("additionalRequirements") or "").strip()
+            logger.info(
+                "FAQGen started faqId=%s summaryId=%s userId=%s questions=%d detailLevel=%s additional_requirements_len=%d",
+                faq_id,
+                summary_id,
+                user_id,
+                num_questions,
+                detail_level,
+                len(additional_requirements),
+            )
+
+            summary_context = await self.db.get_summary_context(summary_id)
+            if summary_context is None:
+                raise RuntimeError(f"Summary not found: {summary_id}")
+
+            theme_id = summary_context.get("themeId")
+            subject_id = summary_context.get("subjectId")
+            source_file_id = summary_context.get("sourceFileId")
+            expected_s3_key = str(summary_context.get("lectureS3Key") or "").strip()
+            if theme_id is None:
+                raise RuntimeError(f"Summary {summary_id} has no themeId")
+            if source_file_id is None:
+                raise RuntimeError(f"Summary {summary_id} has no source fileId")
+            if not expected_s3_key:
+                raise RuntimeError(f"Summary {summary_id} source file has no s3Index")
+
+            lecture_s3_key = expected_s3_key
+            s3_keys = [lecture_s3_key]
+            work_dir = self._work_dir("faq", faq_id)
+            logger.info(
+                "FAQGen context resolved faqId=%s summaryId=%s subjectId=%s themeId=%s sourceFileId=%s work_dir=%s",
+                faq_id,
+                summary_id,
+                subject_id,
+                theme_id,
+                source_file_id,
+                work_dir,
+            )
+
+            local_file = await asyncio.to_thread(self.s3.download_to_materials, lecture_s3_key, work_dir)
+            source_path = Path(local_file)
+            logger.info("FAQGen source downloaded faqId=%s path=%s", faq_id, source_path)
+
+            source_text = await asyncio.to_thread(_extract_faq_source_text, source_path)
+            if len(source_text) > settings.quiz_source_max_chars:
+                original_chars = len(source_text)
+                source_text = _sample_text(source_text, settings.quiz_source_max_chars)
+                logger.info(
+                    "FAQGen source text sampled faqId=%s original_chars=%d sampled_chars=%d",
+                    faq_id,
+                    original_chars,
+                    len(source_text),
+                )
+
+            cfg = FAQGenerationConfig(
+                language="ru",
+                num_questions=num_questions,
+                detail_level=detail_level,
+                additional_requirements=additional_requirements,
+            )
+            faq = await generate_faq_from_text(source_text, title=title, cfg=cfg)
+            if not faq.items:
+                raise RuntimeError("FAQ generation returned no items")
+            logger.info("FAQGen items generated faqId=%s count=%d", faq_id, len(faq.items))
+
+            markdown = format_faq_as_markdown(faq)
+            md_path = work_dir / f"faq_{faq_id}.md"
+            pdf_path = work_dir / f"faq_{faq_id}.pdf"
+            await asyncio.to_thread(md_path.write_text, markdown, encoding="utf-8")
+            await asyncio.to_thread(markdown_to_pdf, md_path, pdf_path)
+            logger.info("FAQGen PDF exported faqId=%s path=%s", faq_id, pdf_path)
+
+            file_name = f"faq_{faq_id}.pdf"
+            s3_key = await asyncio.to_thread(
+                self.s3.upload_file_to_bucket,
+                local_path=str(pdf_path),
+                original_name=file_name,
+                bucket="faqs",
+                user_id=str(user_id),
+            )
+
+            faq_file_id = uuid4()
+            await self.db.save_faq(
+                faq_id=faq_id,
+                summary_id=summary_id,
+                theme_id=int(theme_id),
+                source_file_id=source_file_id,
+                faq_file_id=faq_file_id,
+                s3_key=s3_key,
+                file_name=file_name,
+                user_id=user_id,
+                difficulty_level=detail_level,
+                num_questions=num_questions,
+            )
+            logger.info("FAQGen persisted faqId=%s fileId=%s s3_key=%s", faq_id, faq_file_id, s3_key)
+
+            await self._publish(
+                self.rabbit.queue_faq_gen_complete,
+                {
+                    "faqId": str(faq_id),
+                    "userId": str(user_id),
+                    "status": "SUCCESS",
+                    "error": "",
+                },
+            )
+            logger.info("FAQGen completed faqId=%s status=SUCCESS", faq_id)
+
+        except Exception as e:
+            logger.exception("FAQGen failed faqId=%s error=%s", response_faq_id, e)
+            await self._publish(
+                self.rabbit.queue_faq_gen_complete,
+                {
+                    "faqId": response_faq_id,
+                    "userId": response_user_id,
+                    "status": "FAILED",
+                    "error": str(e),
+                },
+            )
+        finally:
+            await asyncio.to_thread(self.s3.finish_task_cache_usage, s3_keys)
 
     async def handle_summary_gen(self, payload: dict) -> None:
         """

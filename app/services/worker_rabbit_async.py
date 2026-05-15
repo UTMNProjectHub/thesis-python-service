@@ -33,13 +33,19 @@ async def main():
         logger.info("Received summary generation task summaryId=%s", payload.get("summaryId"))
         await processor.handle_summary_gen(payload)
 
+    async def faq_handler(payload: dict):
+        logger.info("Received FAQ generation task faqId=%s", payload.get("faqId"))
+        await processor.handle_faq_gen(payload)
+
     await rabbit.listen(rabbit.queue_quiz_gen, quiz_handler)
     await rabbit.listen(rabbit.queue_summary_gen, summary_handler)
+    await rabbit.listen(rabbit.queue_faq_gen, faq_handler)
 
     logger.info(
-        "Rabbit listeners started queues=%s,%s",
+        "Rabbit listeners started queues=%s,%s,%s",
         rabbit.queue_quiz_gen,
         rabbit.queue_summary_gen,
+        rabbit.queue_faq_gen,
     )
 
     while True:

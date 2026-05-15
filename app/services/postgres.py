@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
 import asyncpg
@@ -45,6 +45,116 @@ class PostgresClient:
         for row in rows:
             logger.info("Postgres S3 key fileId=%s s3Index=%s", row["id"], row["s3Index"])
         return result
+
+    async def get_summary_context(self, summary_id: int) -> Optional[dict[str, Any]]:
+        pool = await self.connect()
+        logger.info("Postgres loading summary context summaryId=%s", summary_id)
+        row = await pool.fetchrow(
+            """
+            SELECT
+                s.id AS "summaryId",
+                s."subjectId",
+                s."themeId",
+                s."fileId" AS "sourceFileId",
+                f.name AS "sourceFileName",
+                f."s3Index" AS "lectureS3Key"
+            FROM thesis.summaries s
+            JOIN thesis.files f ON f.id = s."fileId"
+            WHERE s.id = $1
+            """,
+            summary_id,
+        )
+        if row is None:
+            logger.warning("Postgres summary context not found summaryId=%s", summary_id)
+            return None
+
+        result = dict(row)
+        logger.info(
+            "Postgres summary context loaded summaryId=%s subjectId=%s themeId=%s sourceFileId=%s",
+            summary_id,
+            result.get("subjectId"),
+            result.get("themeId"),
+            result.get("sourceFileId"),
+        )
+        return result
+
+    async def save_faq(
+            self,
+            *,
+            faq_id: UUID,
+            summary_id: int,
+            theme_id: int,
+            source_file_id: UUID,
+            faq_file_id: UUID,
+            s3_key: str,
+            file_name: str,
+            user_id: UUID,
+            difficulty_level: str,
+            num_questions: int,
+    ) -> None:
+        pool = await self.connect()
+        logger.info(
+            "Postgres saving FAQ faqId=%s summaryId=%s themeId=%s fileId=%s sourceFileId=%s",
+            faq_id,
+            summary_id,
+            theme_id,
+            faq_file_id,
+            source_file_id,
+        )
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO thesis.files(id, name, "s3Index", "userId")
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (id) DO UPDATE
+                    SET name = EXCLUDED.name,
+                        "s3Index" = EXCLUDED."s3Index",
+                        "userId" = EXCLUDED."userId"
+                    """,
+                    faq_file_id,
+                    file_name,
+                    s3_key,
+                    user_id,
+                )
+
+                await conn.execute(
+                    """
+                    INSERT INTO thesis.faqs(id, "themeId", "difficultyLevel", num_questions, "fileId", "summaryId")
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (id) DO UPDATE
+                    SET "themeId" = EXCLUDED."themeId",
+                        "difficultyLevel" = EXCLUDED."difficultyLevel",
+                        num_questions = EXCLUDED.num_questions,
+                        "fileId" = EXCLUDED."fileId",
+                        "summaryId" = EXCLUDED."summaryId"
+                    """,
+                    faq_id,
+                    theme_id,
+                    difficulty_level,
+                    num_questions,
+                    faq_file_id,
+                    summary_id,
+                )
+
+                await conn.execute(
+                    """
+                    DELETE FROM thesis.references_faq
+                    WHERE "faqId" = $1
+                    """,
+                    faq_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO thesis.references_faq("faqId", "fileId")
+                    VALUES ($1, $2)
+                    """,
+                    faq_id,
+                    source_file_id,
+                )
+
+        logger.info("Postgres FAQ saved faqId=%s fileId=%s", faq_id, faq_file_id)
 
     async def save_quiz_metadata(
             self,
