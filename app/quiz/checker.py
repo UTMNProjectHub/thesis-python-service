@@ -8,6 +8,19 @@ from app.services.proxy_client import proxy_completion
 
 _DOCUMENT_STORE: dict[str, SimpleVectorStore] = {}
 
+QUIZ_EXPLANATION_SYSTEM_PROMPT = """
+Ты — доброжелательный преподаватель, который объясняет результат ответа студента.
+
+Твоя задача:
+- опираться на текст вопроса, варианты, правильный ответ, ответ студента и учебный контекст;
+- если ответ верный, кратко подтвердить и объяснить, почему он верный;
+- если ответ неверный, объяснить ошибку без резкости и показать правильную логику;
+- не выдумывать дополнительный материал;
+- не показывать source ids, chunk ids, file ids или технические ссылки;
+- отвечать на русском языке;
+- держать объяснение коротким: обычно 2-5 предложений.
+""".strip()
+
 
 async def check_quiz_answers(
         quiz: GeneratedQuiz,
@@ -60,7 +73,7 @@ async def check_quiz_answers(
             explanation, _ = await proxy_completion(
                 text="",
                 user_prompt=prompt,
-                system_prompt="Ты — доброжелательный преподаватель.",
+                system_prompt=QUIZ_EXPLANATION_SYSTEM_PROMPT,
                 temperature=0.3,
                 max_tokens=200,
             )
@@ -82,14 +95,35 @@ async def check_quiz_answers(
 
 def _build_check_prompt(q: QuizQuestion, ua: UserAnswer, is_correct: bool, context: str) -> str:
     wrong_text = ua.text_answer or ", ".join(ua.selected_option_ids or [])
+    variants = "\n".join(
+        f"- id={variant.id}; text={variant.text}; correct={variant.is_correct}; explanation={variant.explanation}"
+        for variant in (q.variants or [])
+    ) or "нет вариантов"
+    correct_answer = q.correct_answer
+    if q.variants:
+        correct_answer = ", ".join(f"{variant.id}: {variant.text}" for variant in q.variants if variant.is_correct)
     return f"""
-        Вопрос: {q.text}
-        Пользователь ответил: {wrong_text}
-        Правильно? {is_correct}
-        Правильный: {q.correct_answer}
-        
-        Контекст: {context}
-        
-        {"Похвали и объясни почему верно." if is_correct else "Объясни ошибку, укажи правильный и почему."}
-        На русском, 2-4 предложения.
-        """
+Вопрос:
+{q.text}
+
+Тип вопроса:
+{q.type}
+
+Все варианты ответа:
+{variants}
+
+Ответ студента:
+{wrong_text}
+
+Результат проверки системой:
+{"ответ верный" if is_correct else "ответ неверный"}
+
+Правильный ответ:
+{correct_answer}
+
+Учебный контекст:
+{context}
+
+{"Подтверди, почему ответ верный." if is_correct else "Объясни ошибку и покажи правильную логику."}
+Ответь на русском в 2-5 предложениях.
+"""
