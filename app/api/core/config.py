@@ -116,6 +116,20 @@ class Settings(BaseSettings):
         default=30_000,
         validation_alias=AliasChoices("QUIZ_SOURCE_MAX_CHARS_PER_FILE", "quiz_source_max_chars_per_file"),
     )
+    quiz_generation_use_source_documents: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "QUIZ_GENERATION_USE_SOURCE_DOCUMENTS",
+            "quiz_generation_use_source_documents",
+        ),
+    )
+    faq_generation_use_source_documents: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "FAQ_GENERATION_USE_SOURCE_DOCUMENTS",
+            "faq_generation_use_source_documents",
+        ),
+    )
     s3_download_cache_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("S3_DOWNLOAD_CACHE_ENABLED", "s3_download_cache_enabled"),
@@ -127,6 +141,217 @@ class Settings(BaseSettings):
     s3_download_cache_ttl_tasks: int = Field(
         default=3,
         validation_alias=AliasChoices("S3_DOWNLOAD_CACHE_TTL_TASKS", "s3_download_cache_ttl_tasks"),
+    )
+    s3_download_cache_lock_timeout_seconds: float = Field(
+        default=900.0,
+        validation_alias=AliasChoices(
+            "S3_DOWNLOAD_CACHE_LOCK_TIMEOUT_SECONDS",
+            "s3_download_cache_lock_timeout_seconds",
+        ),
+    )
+    s3_download_cache_stale_temp_seconds: float = Field(
+        default=3600.0,
+        validation_alias=AliasChoices(
+            "S3_DOWNLOAD_CACHE_STALE_TEMP_SECONDS",
+            "s3_download_cache_stale_temp_seconds",
+        ),
+    )
+    s3_download_cache_stale_lock_seconds: float = Field(
+        default=21600.0,
+        validation_alias=AliasChoices(
+            "S3_DOWNLOAD_CACHE_STALE_LOCK_SECONDS",
+            "s3_download_cache_stale_lock_seconds",
+        ),
+    )
+    s3_download_cache_io_retries: int = Field(
+        default=8,
+        validation_alias=AliasChoices("S3_DOWNLOAD_CACHE_IO_RETRIES", "s3_download_cache_io_retries"),
+    )
+    s3_download_cache_io_retry_delay_seconds: float = Field(
+        default=0.25,
+        validation_alias=AliasChoices(
+            "S3_DOWNLOAD_CACHE_IO_RETRY_DELAY_SECONDS",
+            "s3_download_cache_io_retry_delay_seconds",
+        ),
+    )
+    faq_batch_size: int = Field(
+        default=20,
+        validation_alias=AliasChoices("FAQ_BATCH_SIZE", "faq_batch_size"),
+    )
+    faq_completion_tokens_per_question: int = Field(
+        default=220,
+        validation_alias=AliasChoices(
+            "FAQ_COMPLETION_TOKENS_PER_QUESTION",
+            "faq_completion_tokens_per_question",
+        ),
+    )
+    faq_max_completion_tokens: int = Field(
+        default=8000,
+        validation_alias=AliasChoices("FAQ_MAX_COMPLETION_TOKENS", "faq_max_completion_tokens"),
+    )
+    lecture_target_words: int = Field(
+        default=5000,
+        validation_alias=AliasChoices("LECTURE_TARGET_WORDS", "lecture_target_words"),
+    )
+    lecture_words_per_section: int = Field(
+        default=850,
+        validation_alias=AliasChoices("LECTURE_WORDS_PER_SECTION", "lecture_words_per_section"),
+    )
+    lecture_min_sections: int = Field(
+        default=3,
+        validation_alias=AliasChoices("LECTURE_MIN_SECTIONS", "lecture_min_sections"),
+    )
+    lecture_max_sections: int = Field(
+        default=9,
+        validation_alias=AliasChoices("LECTURE_MAX_SECTIONS", "lecture_max_sections"),
+    )
+    lecture_chunk_tokens: int = Field(
+        default=700,
+        validation_alias=AliasChoices("LECTURE_CHUNK_TOKENS", "lecture_chunk_tokens"),
+    )
+    lecture_base_plan_context_chunks: int = Field(
+        default=16,
+        validation_alias=AliasChoices("LECTURE_BASE_PLAN_CONTEXT_CHUNKS", "lecture_base_plan_context_chunks"),
+    )
+    lecture_base_section_context_chunks: int = Field(
+        default=10,
+        validation_alias=AliasChoices("LECTURE_BASE_SECTION_CONTEXT_CHUNKS", "lecture_base_section_context_chunks"),
+    )
+    lecture_max_plan_context_chunks: int = Field(
+        default=64,
+        validation_alias=AliasChoices("LECTURE_MAX_PLAN_CONTEXT_CHUNKS", "lecture_max_plan_context_chunks"),
+    )
+    lecture_max_section_context_chunks: int = Field(
+        default=32,
+        validation_alias=AliasChoices("LECTURE_MAX_SECTION_CONTEXT_CHUNKS", "lecture_max_section_context_chunks"),
+    )
+    lecture_retrieval_pool_k: int = Field(
+        default=40,
+        validation_alias=AliasChoices("LECTURE_RETRIEVAL_POOL_K", "lecture_retrieval_pool_k"),
+    )
+    lecture_max_retrieval_pool_k: int = Field(
+        default=180,
+        validation_alias=AliasChoices("LECTURE_MAX_RETRIEVAL_POOL_K", "lecture_max_retrieval_pool_k"),
+    )
+    lecture_plan_context_token_budget: int = Field(
+        default=24_000,
+        validation_alias=AliasChoices("LECTURE_PLAN_CONTEXT_TOKEN_BUDGET", "lecture_plan_context_token_budget"),
+    )
+    lecture_section_context_token_budget: int = Field(
+        default=16_000,
+        validation_alias=AliasChoices("LECTURE_SECTION_CONTEXT_TOKEN_BUDGET", "lecture_section_context_token_budget"),
+    )
+    lecture_document_profiles_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LECTURE_DOCUMENT_PROFILES_ENABLED", "lecture_document_profiles_enabled"),
+    )
+    lecture_doc_profile_chunks: int = Field(
+        default=8,
+        validation_alias=AliasChoices("LECTURE_DOC_PROFILE_CHUNKS", "lecture_doc_profile_chunks"),
+    )
+    lecture_doc_profile_max_chunks: int = Field(
+        default=16,
+        validation_alias=AliasChoices("LECTURE_DOC_PROFILE_MAX_CHUNKS", "lecture_doc_profile_max_chunks"),
+    )
+    lecture_doc_profile_max_tokens: int = Field(
+        default=700,
+        validation_alias=AliasChoices("LECTURE_DOC_PROFILE_MAX_TOKENS", "lecture_doc_profile_max_tokens"),
+    )
+    lecture_final_edit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LECTURE_FINAL_EDIT_ENABLED", "lecture_final_edit_enabled"),
+    )
+    lecture_final_edit_input_token_budget: int = Field(
+        default=50_000,
+        validation_alias=AliasChoices("LECTURE_FINAL_EDIT_INPUT_TOKEN_BUDGET", "lecture_final_edit_input_token_budget"),
+    )
+    document_index_cache_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_ENABLED", "document_index_cache_enabled"),
+    )
+    document_index_cache_db_path: str = Field(
+        default="files_materials/_document_index_cache/index.sqlite3",
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_DB_PATH", "document_index_cache_db_path"),
+    )
+    document_index_cache_lock_timeout_seconds: float = Field(
+        default=900.0,
+        validation_alias=AliasChoices(
+            "DOCUMENT_INDEX_CACHE_LOCK_TIMEOUT_SECONDS",
+            "document_index_cache_lock_timeout_seconds",
+        ),
+    )
+    document_index_cache_stale_lock_seconds: float = Field(
+        default=21600.0,
+        validation_alias=AliasChoices(
+            "DOCUMENT_INDEX_CACHE_STALE_LOCK_SECONDS",
+            "document_index_cache_stale_lock_seconds",
+        ),
+    )
+    document_index_cache_busy_timeout_ms: int = Field(
+        default=30_000,
+        validation_alias=AliasChoices("DOCUMENT_INDEX_CACHE_BUSY_TIMEOUT_MS", "document_index_cache_busy_timeout_ms"),
+    )
+    quiz_answer_dialog_summary_message_limit: int = Field(
+        default=30,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_MESSAGE_LIMIT",
+            "quiz_answer_dialog_summary_message_limit",
+        ),
+    )
+    quiz_answer_dialog_top_k_chunks: int = Field(
+        default=6,
+        validation_alias=AliasChoices("QUIZ_ANSWER_DIALOG_TOP_K_CHUNKS", "quiz_answer_dialog_top_k_chunks"),
+    )
+    quiz_answer_dialog_context_token_budget: int = Field(
+        default=6000,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_CONTEXT_TOKEN_BUDGET",
+            "quiz_answer_dialog_context_token_budget",
+        ),
+    )
+    quiz_answer_dialog_max_response_tokens: int = Field(
+        default=700,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_MAX_RESPONSE_TOKENS",
+            "quiz_answer_dialog_max_response_tokens",
+        ),
+    )
+    quiz_answer_dialog_lock_timeout_seconds: float = Field(
+        default=300.0,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_LOCK_TIMEOUT_SECONDS",
+            "quiz_answer_dialog_lock_timeout_seconds",
+        ),
+    )
+    quiz_answer_dialog_summary_cache_db_path: str = Field(
+        default="files_materials/_quiz_answer_dialog_cache/summaries.sqlite3",
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_CACHE_DB_PATH",
+            "quiz_answer_dialog_summary_cache_db_path",
+        ),
+    )
+    quiz_answer_dialog_summary_cache_busy_timeout_ms: int = Field(
+        default=30_000,
+        validation_alias=AliasChoices(
+            "QUIZ_ANSWER_DIALOG_SUMMARY_CACHE_BUSY_TIMEOUT_MS",
+            "quiz_answer_dialog_summary_cache_busy_timeout_ms",
+        ),
+    )
+    pdf_font_regular: str = Field(
+        default="",
+        validation_alias=AliasChoices("PDF_FONT_REGULAR", "pdf_font_regular"),
+    )
+    pdf_font_bold: str = Field(
+        default="",
+        validation_alias=AliasChoices("PDF_FONT_BOLD", "pdf_font_bold"),
+    )
+    pdf_font_italic: str = Field(
+        default="",
+        validation_alias=AliasChoices("PDF_FONT_ITALIC", "pdf_font_italic"),
+    )
+    pdf_font_bold_italic: str = Field(
+        default="",
+        validation_alias=AliasChoices("PDF_FONT_BOLD_ITALIC", "pdf_font_bold_italic"),
     )
 
     elysia_port: int | None = Field(

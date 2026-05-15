@@ -1,13 +1,17 @@
+from pathlib import Path
+
 from PyPDF2 import PdfReader
 
 
 def extract_text_from_pdf(path: str) -> str:
+    p = Path(path)
     try:
-        reader = PdfReader(path)
         chunks = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            chunks.append(text)
+        with p.open("rb") as f:
+            reader = PdfReader(f)
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                chunks.append(text)
         full_text = "\n".join(chunks).strip()
         if not full_text:
             full_text = ""

@@ -21,11 +21,16 @@ from reportlab.platypus import (
     Preformatted,
     SimpleDocTemplate,
     Spacer,
+    Table,
+    TableStyle,
 )
+
+from app.api.core.config import settings
 
 
 PathLike = Union[str, Path]
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 _SUBSCRIPT_CHARS = {
@@ -87,6 +92,12 @@ _SUPERSCRIPT_RE = re.compile(f"[{''.join(re.escape(ch) for ch in _SUPERSCRIPT_CH
 # TODO: Сделать подгрузку шрифтов
 _FONT_FAMILIES = [
     {
+        "regular": str(PROJECT_ROOT / "assets" / "fonts" / "NotoSans-Regular.ttf"),
+        "bold": str(PROJECT_ROOT / "assets" / "fonts" / "NotoSans-Bold.ttf"),
+        "italic": str(PROJECT_ROOT / "assets" / "fonts" / "NotoSans-Italic.ttf"),
+        "bold_italic": str(PROJECT_ROOT / "assets" / "fonts" / "NotoSans-BoldItalic.ttf"),
+    },
+    {
         "regular": "C:/Windows/Fonts/arial.ttf",
         "bold": "C:/Windows/Fonts/arialbd.ttf",
         "italic": "C:/Windows/Fonts/ariali.ttf",
@@ -102,7 +113,16 @@ _FONT_FAMILIES = [
 
 
 def _register_unicode_font() -> str:
-    for family in _FONT_FAMILIES:
+    env_family = {
+        "regular": settings.pdf_font_regular,
+        "bold": settings.pdf_font_bold,
+        "italic": settings.pdf_font_italic,
+        "bold_italic": settings.pdf_font_bold_italic,
+    }
+    families = [env_family] if all(env_family.values()) else []
+    families.extend(_FONT_FAMILIES)
+
+    for family in families:
         regular = Path(family["regular"])
         bold = Path(family["bold"])
         italic = Path(family["italic"])
@@ -289,6 +309,41 @@ def _list_flowable(items: Iterable[str], ordered: bool, styles: dict[str, Paragr
     return ListFlowable(flowables, **params)
 
 
+def _is_table_separator(line: str) -> bool:
+    cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+    return bool(cells) and all(re.match(r"^:?-{3,}:?$", cell or "") for cell in cells)
+
+
+def _parse_table_row(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def _table_flowable(rows: list[list[str]], styles: dict[str, ParagraphStyle], font_name: str) -> Table:
+    col_count = max(len(row) for row in rows)
+    normalized = [row + [""] * (col_count - len(row)) for row in rows]
+    data = [
+        [Paragraph(_inline_markdown(cell, font_name), styles["body"]) for cell in row]
+        for row in normalized
+    ]
+    table = Table(data, repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("FONTNAME", (0, 0), (-1, -1), font_name),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eef2f7")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1f2933")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    return table
+
+
 def _markdown_to_flowables(markdown: str, styles: dict[str, ParagraphStyle], font_name: str) -> List:
     lines = markdown.replace("\r\n", "\n").split("\n")
     flowables: List = []
@@ -361,6 +416,20 @@ def _markdown_to_flowables(markdown: str, styles: dict[str, ParagraphStyle], fon
                 )
             )
             i += 1
+            continue
+
+        if "|" in stripped and i + 1 < len(lines) and _is_table_separator(lines[i + 1].strip()):
+            flush_paragraph()
+            table_rows = [_parse_table_row(stripped)]
+            i += 2
+            while i < len(lines):
+                current = lines[i].strip()
+                if not current or "|" not in current:
+                    break
+                table_rows.append(_parse_table_row(current))
+                i += 1
+            flowables.append(_table_flowable(table_rows, styles, font_name))
+            flowables.append(Spacer(1, 7))
             continue
 
         bullet = re.match(r"^[-*+]\s+(.+)$", stripped)

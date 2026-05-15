@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 from app.curriculum.models import LectureTopic, DifficultyLevel
+from app.documents.chunking import estimate_tokens
 from app.documents.indexers.base import BaseRetriever
 from app.documents.models import DocumentChunk
+from app.lectures.context_selection import DocumentProfile, select_balanced_chunks
 from app.lectures.models import LecturePlan, LectureSection, SectionKind
 from app.services.proxy_client import proxy_completion
 
@@ -34,7 +36,8 @@ def _difficulty_comment(level: DifficultyLevel) -> str:
 
 def _build_context_from_chunks(
         chunks: List[Tuple[DocumentChunk, float]],
-        max_chars_per_chunk: int = 1200,
+        max_chars_per_chunk: int | None = None,
+        token_budget: int | None = None,
 ) -> str:
     """
     Формирует текстовый контекст для LLM из релевантных чанков.
@@ -43,10 +46,15 @@ def _build_context_from_chunks(
     чтобы модель могла ссылаться на них в поле `sources`.
     """
     lines: List[str] = []
+    used_tokens = 0
     for idx, (chunk, score) in enumerate(chunks, start=1):
         frag_id = f"F{idx}"
         text = chunk.text.strip().replace("\r\n", "\n")
-        if len(text) > max_chars_per_chunk:
+        chunk_tokens = estimate_tokens(text)
+        if token_budget is not None and lines and used_tokens + chunk_tokens > token_budget:
+            break
+        used_tokens += chunk_tokens
+        if max_chars_per_chunk is not None and len(text) > max_chars_per_chunk:
             text = text[:max_chars_per_chunk] + " [...]"
 
         header = (
@@ -107,6 +115,10 @@ async def build_lecture_plan_for_topic(
         retriever: BaseRetriever,
         *,
         top_k_chunks: int = 8,
+        retrieval_pool_k: int | None = None,
+        context_token_budget: int | None = None,
+        document_profiles: Sequence[DocumentProfile] | None = None,
+        additional_requirements: str = "",
         min_sections: int = 3,
         max_sections: int = 7,
 ) -> LecturePlan:
@@ -134,10 +146,21 @@ async def build_lecture_plan_for_topic(
         query = topic.title
 
     # --- 2. Поиск релевантных чанков ---
-    chunk_results: List[Tuple[DocumentChunk, float]] = retriever.search(query, top_k=top_k_chunks)
+    chunk_results: List[Tuple[DocumentChunk, float]] = select_balanced_chunks(
+        retriever,
+        query,
+        pool_k=retrieval_pool_k or top_k_chunks,
+        limit=top_k_chunks,
+        token_budget=context_token_budget,
+        doc_ids=topic.source_docs,
+    )
 
     # --- 3. Готовим контекст для модели ---
-    context_text = _build_context_from_chunks(chunk_results) if chunk_results else ""
+    context_text = _build_context_from_chunks(
+        chunk_results,
+        max_chars_per_chunk=None,
+        token_budget=context_token_budget,
+    ) if chunk_results else ""
 
     difficulty_hint = _difficulty_comment(topic.difficulty)
 
@@ -188,6 +211,22 @@ async def build_lecture_plan_for_topic(
     if topic.keywords:
         user_prompt_parts.append("Ключевые слова/понятия:")
         user_prompt_parts.append(", ".join(topic.keywords))
+        user_prompt_parts.append("")
+
+    if additional_requirements.strip():
+        user_prompt_parts.append("Дополнительные требования к лекции:")
+        user_prompt_parts.append(additional_requirements.strip())
+        user_prompt_parts.append("")
+
+    if document_profiles:
+        user_prompt_parts.append("Краткие профили выбранных документов:")
+        for profile in document_profiles:
+            user_prompt_parts.append(
+                f"- document={profile.doc_id}; title={profile.title}; pages={profile.pages}; chunks={profile.chunk_count}"
+            )
+            user_prompt_parts.append(profile.summary)
+            if profile.coverage and profile.coverage != profile.summary:
+                user_prompt_parts.append(profile.coverage)
         user_prompt_parts.append("")
 
     if context_text:

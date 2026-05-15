@@ -17,12 +17,12 @@ def extract_pdf_pages(path: str | Path) -> List[str]:
     if not p.exists():
         raise FileNotFoundError(f"PDF not found: {p}")
 
-    reader = PdfReader(str(p))
     pages_text: List[str] = []
-
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        pages_text.append(text)
+    with p.open("rb") as f:
+        reader = PdfReader(f)
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            pages_text.append(text)
 
     return pages_text
 

@@ -25,7 +25,7 @@ class EmbeddingsRetriever(BaseRetriever):
         self._embeddings: np.ndarray | None = None  # shape: (N, dim)
 
     @staticmethod
-    def _split_oversized_chunks(chunks: List[DocumentChunk], max_tokens: int = 700) -> List[DocumentChunk]:
+    def prepare_embedding_chunks(chunks: List[DocumentChunk], max_tokens: int = 700) -> List[DocumentChunk]:
         result: List[DocumentChunk] = []
         for chunk in chunks:
             if estimate_tokens(chunk.text) < max_tokens:
@@ -44,6 +44,8 @@ class EmbeddingsRetriever(BaseRetriever):
                     )
                 )
         return result
+
+    _split_oversized_chunks = prepare_embedding_chunks
 
     def index(self, chunks: List[DocumentChunk]) -> None:
         """
@@ -65,6 +67,23 @@ class EmbeddingsRetriever(BaseRetriever):
 
         self._chunks = safe_chunks
         self._embeddings = np.asarray(embeddings, dtype="float32")
+
+    def index_precomputed(self, chunks: List[DocumentChunk], embeddings: np.ndarray | List[List[float]]) -> None:
+        if not chunks:
+            self._chunks = []
+            self._embeddings = None
+            return
+
+        array = np.asarray(embeddings, dtype="float32")
+        if array.ndim != 2:
+            raise ValueError(f"Expected 2D embeddings array, got shape={array.shape}")
+        if array.shape[0] != len(chunks):
+            raise ValueError(
+                f"Embeddings count mismatch: chunks={len(chunks)} embeddings={array.shape[0]}"
+            )
+
+        self._chunks = list(chunks)
+        self._embeddings = array
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:
         """
