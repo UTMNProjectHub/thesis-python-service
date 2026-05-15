@@ -36,8 +36,10 @@ class RabbitClient:
 
         self.queue_quiz_gen = "quiz.generation.request"
         self.queue_summary_gen = "summary.generation.request"
+        self.queue_faq_gen = "faq.generation.request"
         self.queue_quiz_gen_complete = "quiz.generation.complete"
         self.queue_summary_gen_complete = "summary.generation.complete"
+        self.queue_faq_gen_complete = "faq.generation.complete"
 
     def publish(self, queue: str, payload: dict) -> None:
         """
@@ -66,7 +68,9 @@ class RabbitClient:
         payload (QuizGen):
         {
             quizId: uuid,
+            userId: uuid,
             files: uuid[],
+            summaryId: number,
             difficulty: "easy"|"medium"|"hard",
             question_count: number,
             question_types: string[],
@@ -82,11 +86,27 @@ class RabbitClient:
             summaryId: uuid,
             subjectId: number,
             themeId: number,
+            userId: uuid,
             files: uuid[],
             additional_requirements: text
         }
         """
         self.publish(self.queue_summary_gen, payload)
+
+    def enqueue_faq_generation(self, payload: dict):
+        """
+        payload (FAQGen):
+        {
+            summaryId: int,
+            faqId: uuid,
+            userId: uuid,
+            title: str,
+            numQuestions: int,
+            detailLevel: "easy"|"medium"|"hard",
+            additionalRequirements: text
+        }
+        """
+        self.publish(self.queue_faq_gen, payload)
 
     def listen(self, queue: str, callback: Callable[[dict], None]):
         """
@@ -133,6 +153,7 @@ class RabbitClient:
         callback принимает payload (QuizGenComplete):
         {
             quizId: uuid,
+            userId: uuid,
             status: "SUCCESS"|"FAILED",
             error: string
         }
@@ -146,11 +167,24 @@ class RabbitClient:
             summaryId: uuid,
             subjectId: number,
             themeId: number,
+            userId: uuid,
             status: "SUCCESS"|"FAILED",
             error: string
         }
         """
         self.listen(self.queue_summary_gen_complete, callback)
+
+    def on_faq_generation_complete(self, callback: Callable[[dict], None]):
+        """
+        callback receives payload (FAQGenComplete):
+        {
+            faqId: uuid,
+            userId: uuid,
+            status: "SUCCESS"|"FAILED",
+            error: string
+        }
+        """
+        self.listen(self.queue_faq_gen_complete, callback)
 
 
 def get_rabbit_client() -> RabbitClient:

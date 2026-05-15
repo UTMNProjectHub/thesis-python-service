@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
 from app.api.core.config import settings
 
+logger = logging.getLogger(__name__)
 client = AsyncOpenAI(api_key=settings.proxyapi_key, base_url=settings.base_url)
 
 
@@ -42,5 +44,5 @@ async def proxy_completion(
         return text_out.strip(), data.get("model", settings.model)
 
     except Exception as exc:
-        print(f"ProxyAPI error: {exc}")
-        return "", settings.model
+        logger.exception("ProxyAPI completion failed model=%s error=%s", settings.model, exc)
+        raise RuntimeError(f"ProxyAPI completion failed: {exc}") from exc

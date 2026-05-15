@@ -24,8 +24,10 @@ class AsyncRabbitClient:
 
         self.queue_quiz_gen = "quiz.generation.request"
         self.queue_summary_gen = "summary.generation.request"
+        self.queue_faq_gen = "faq.generation.request"
         self.queue_quiz_gen_complete = "quiz.generation.complete"
         self.queue_summary_gen_complete = "summary.generation.complete"
+        self.queue_faq_gen_complete = "faq.generation.complete"
 
     async def connect(self):
         """
