@@ -24,6 +24,39 @@ logger = logging.getLogger(__name__)
 FILES_DIR = Path("files_materials")
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 
+ALLOWED_FILE_SUFFIXES = {
+    ".pdf",
+    ".md",
+    ".markdown",
+    ".txt",
+    ".docx",
+}
+
+
+def _safe_file_suffix(*values: object, default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+
+        suffix = Path(str(value)).suffix.lower().strip()
+        if suffix in ALLOWED_FILE_SUFFIXES:
+            return suffix
+
+    return default
+
+
+def _safe_object_suffix(object_name: str, default: str = "") -> str:
+    normalized = str(object_name or "").strip().replace("\\", "/").lstrip("/")
+    normalized_lower = normalized.lower()
+
+    if normalized_lower.startswith("summaries/"):
+        return ".pdf"
+
+    if normalized_lower.startswith("faqs/"):
+        return ".pdf"
+
+    return _safe_file_suffix(normalized, default=default)
+
 
 def _safe_upload_name(original_name: str | None, local_path: str) -> str:
     local = Path(local_path)
@@ -32,8 +65,10 @@ def _safe_upload_name(original_name: str | None, local_path: str) -> str:
     raw_name = re.sub(r"[\x00-\x1f\x7f]+", "", raw_name)
     raw_name = raw_name.strip(" .") or local.name or "file"
 
-    local_suffix = local.suffix
-    if local_suffix and not Path(raw_name).suffix:
+    raw_suffix = Path(raw_name).suffix.lower().strip()
+    local_suffix = local.suffix.lower().strip()
+
+    if raw_suffix not in ALLOWED_FILE_SUFFIXES and local_suffix in ALLOWED_FILE_SUFFIXES:
         raw_name = f"{raw_name}{local_suffix}"
 
     return raw_name
@@ -246,7 +281,7 @@ class S3Client:
 
     def _cache_path(self, object_name: str) -> Path:
         normalized = self._normalize_object_name(object_name)
-        suffix = Path(normalized).suffix
+        suffix = _safe_object_suffix(normalized)
         return self.cache_dir / f"{self._cache_key(normalized)}{suffix}"
 
     def _get_object_lock(self, cache_key: str) -> threading.RLock:
@@ -969,7 +1004,7 @@ class S3Client:
         safe_name = _safe_upload_name(original_name, local_path)
         file_id = str(uuid.uuid4())
         file_hash = self.compute_file_hash(local_path)
-        suffix = Path(safe_name).suffix or Path(local_path).suffix
+        suffix = _safe_file_suffix(local_path, safe_name, default=".bin")
         hashed_name = f"{file_hash}{suffix}"
 
         if bucket:
@@ -985,7 +1020,7 @@ class S3Client:
             "original_name": _ascii_metadata_value(safe_name),
             "file_hash": file_hash,
         }
-        content_type = mimetypes.guess_type(safe_name)[0]
+        content_type = mimetypes.guess_type(f"file{suffix}")[0] or mimetypes.guess_type(safe_name)[0]
 
         try:
             logger.info(
