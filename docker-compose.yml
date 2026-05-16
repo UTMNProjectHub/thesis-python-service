@@ -1,6 +1,6 @@
 name: quizy-python-service
 
-x-python-service: &python-service
+python-service: &python-service
   image: quizy-python-service:${IMAGE_TAG:-latest}
   build:
     context: .

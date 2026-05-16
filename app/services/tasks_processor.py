@@ -270,14 +270,26 @@ class LectureSource:
     text: str
 
 
+def _is_pdf_file(file_path: Path) -> bool:
+    try:
+        with file_path.open("rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
 def _extract_source_text(file_path: Path) -> str:
-    suffix = file_path.suffix.lower()
+    suffix = file_path.suffix.lower().strip()
+
     if suffix in (".md", ".markdown", ".txt"):
         text = file_path.read_text(encoding="utf-8")
     elif suffix == ".pdf":
         text = extract_text_from_pdf(str(file_path))
     elif suffix == ".docx":
         text = extract_docx_text(file_path)
+    elif _is_pdf_file(file_path):
+    
+        text = extract_text_from_pdf(str(file_path))
     else:
         raise RuntimeError(f"Unsupported FAQ source file type: {suffix}")
 
