@@ -123,6 +123,13 @@ class Settings(BaseSettings):
             "quiz_generation_use_source_documents",
         ),
     )
+    quiz_generation_fill_max_attempts: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "QUIZ_GENERATION_FILL_MAX_ATTEMPTS",
+            "quiz_generation_fill_max_attempts",
+        ),
+    )
     faq_generation_use_source_documents: bool = Field(
         default=False,
         validation_alias=AliasChoices(
@@ -245,6 +252,13 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("LECTURE_DOCUMENT_PROFILES_ENABLED", "lecture_document_profiles_enabled"),
     )
+    lecture_large_corpus_profile_min_docs: int = Field(
+        default=50,
+        validation_alias=AliasChoices(
+            "LECTURE_LARGE_CORPUS_PROFILE_MIN_DOCS",
+            "lecture_large_corpus_profile_min_docs",
+        ),
+    )
     lecture_doc_profile_chunks: int = Field(
         default=8,
         validation_alias=AliasChoices("LECTURE_DOC_PROFILE_CHUNKS", "lecture_doc_profile_chunks"),
@@ -256,6 +270,10 @@ class Settings(BaseSettings):
     lecture_doc_profile_max_tokens: int = Field(
         default=700,
         validation_alias=AliasChoices("LECTURE_DOC_PROFILE_MAX_TOKENS", "lecture_doc_profile_max_tokens"),
+    )
+    lecture_doc_profile_llm_max_docs: int = Field(
+        default=30,
+        validation_alias=AliasChoices("LECTURE_DOC_PROFILE_LLM_MAX_DOCS", "lecture_doc_profile_llm_max_docs"),
     )
     lecture_final_edit_enabled: bool = Field(
         default=True,
@@ -309,20 +327,8 @@ class Settings(BaseSettings):
             "quiz_answer_dialog_context_token_budget",
         ),
     )
-    model_context_window_tokens: int = Field(
-        default=128_000,
-        validation_alias=AliasChoices("MODEL_CONTEXT_WINDOW_TOKENS", "model_context_window_tokens"),
-    )
-    reserved_output_tokens: int = Field(
-        default=8_000,
-        validation_alias=AliasChoices("RESERVED_OUTPUT_TOKENS", "reserved_output_tokens"),
-    )
-    prompt_overhead_tokens: int = Field(
-        default=2_000,
-        validation_alias=AliasChoices("PROMPT_OVERHEAD_TOKENS", "prompt_overhead_tokens"),
-    )
     quiz_answer_dialog_rag_min_token_budget: int = Field(
-        default=6_000,
+        default=4_000,
         validation_alias=AliasChoices(
             "QUIZ_ANSWER_DIALOG_RAG_MIN_TOKEN_BUDGET",
             "quiz_answer_dialog_rag_min_token_budget",
@@ -355,6 +361,18 @@ class Settings(BaseSettings):
             "QUIZ_ANSWER_DIALOG_SUMMARY_CACHE_BUSY_TIMEOUT_MS",
             "quiz_answer_dialog_summary_cache_busy_timeout_ms",
         ),
+    )
+    model_context_window_tokens: int = Field(
+        default=128_000,
+        validation_alias=AliasChoices("MODEL_CONTEXT_WINDOW_TOKENS", "model_context_window_tokens"),
+    )
+    reserved_output_tokens: int = Field(
+        default=8_000,
+        validation_alias=AliasChoices("RESERVED_OUTPUT_TOKENS", "reserved_output_tokens"),
+    )
+    prompt_overhead_tokens: int = Field(
+        default=2_000,
+        validation_alias=AliasChoices("PROMPT_OVERHEAD_TOKENS", "prompt_overhead_tokens"),
     )
     pdf_font_regular: str = Field(
         default="",

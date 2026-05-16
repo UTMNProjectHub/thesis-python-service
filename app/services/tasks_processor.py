@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,7 @@ from app.api.core.config import settings
 from app.curriculum.models import LectureTopic, DifficultyLevel
 from app.documents.chunking import chunk_document_pages, estimate_tokens
 from app.documents.docx_reader import extract_docx_text
-from app.documents.index_cache import DocumentIndexCache, DocumentIndexData
+from app.documents.index_cache import DocumentIndexBuildRequest, DocumentIndexCache, DocumentIndexData
 from app.documents.indexers import EmbeddingsRetriever, HybridRetriever, TfidfRetriever
 from app.documents.models import Document
 from app.documents.pdf_reader import load_pdf_document
@@ -186,6 +187,36 @@ def _distribute_question_counts(
             counts[t] = 1
 
     return counts
+
+
+def _question_text_key(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text).strip().lower())
+
+
+def _quiz_config_from_ui_counts(ui_counts: dict[str, int]) -> QuizGenerationConfig:
+    num_true_false = ui_counts.get("truefalse", 0)
+    num_multichoice = ui_counts.get("multichoice", 0)
+    num_matching = ui_counts.get("matching", 0)
+    num_shortanswer = ui_counts.get("shortanswer", 0)
+    num_essay = ui_counts.get("essay", 0)
+
+    return QuizGenerationConfig(
+        language="Русский",
+        generate_true_false=num_true_false > 0,
+        num_true_false=num_true_false,
+        generate_multiple_choice=num_multichoice > 0,
+        num_multiple_choice=num_multichoice,
+        generate_select_all_that_apply=False,
+        num_select_all_that_apply=0,
+        generate_fill_in_the_blank=False,
+        num_fill_in_the_blank=0,
+        generate_matching=num_matching > 0,
+        num_matching=num_matching,
+        generate_short_answer=num_shortanswer > 0,
+        num_short_answer=num_shortanswer,
+        generate_long_answer=num_essay > 0,
+        num_long_answer=num_essay,
+    )
 
 
 def _sample_text(text: str, max_chars: int) -> str:
@@ -1512,6 +1543,8 @@ class TaskProcessor:
             all_chunks = []
             all_embedding_chunks = []
             embedding_arrays = []
+
+            pdf_inputs = []
             for record, local_file in zip(file_records, local_files):
                 if not local_file:
                     continue
@@ -1524,10 +1557,12 @@ class TaskProcessor:
                         pdf_path,
                     )
                     continue
+                pdf_inputs.append((record, pdf_path))
 
-                if document_index_cache is not None:
-                    cache_entry = await asyncio.to_thread(
-                        document_index_cache.get_or_build,
+            if document_index_cache is not None and pdf_inputs:
+                cache_started = time.perf_counter()
+                requests = [
+                    DocumentIndexBuildRequest(
                         file_path=pdf_path,
                         file_id=str(record.file_id),
                         file_name=record.name,
@@ -1542,6 +1577,19 @@ class TaskProcessor:
                             settings.embedding_model,
                         ),
                     )
+                    for record, pdf_path in pdf_inputs
+                ]
+                cache_entries = await asyncio.to_thread(document_index_cache.get_or_build_many, requests)
+                cache_hits = sum(1 for entry in cache_entries if entry.cache_hit)
+                logger.info(
+                    "SummaryGen document index bulk ready summaryId=%s files=%d cache_hits=%d cache_misses=%d seconds=%.3f",
+                    summary_id,
+                    len(cache_entries),
+                    cache_hits,
+                    len(cache_entries) - cache_hits,
+                    time.perf_counter() - cache_started,
+                )
+                for (record, _pdf_path), cache_entry in zip(pdf_inputs, cache_entries):
                     doc = cache_entry.document
                     chunks = cache_entry.chunks
                     all_embedding_chunks.extend(cache_entry.embedding_chunks)
@@ -1557,7 +1605,11 @@ class TaskProcessor:
                         len(cache_entry.embedding_chunks),
                         cache_entry.cache_hit,
                     )
-                else:
+                    documents.append(doc)
+                    chunks_by_doc[doc.id] = chunks
+                    all_chunks.extend(chunks)
+            else:
+                for record, pdf_path in pdf_inputs:
                     parsed_started = time.perf_counter()
                     doc, pages = await asyncio.to_thread(
                         load_pdf_document,
@@ -1580,19 +1632,31 @@ class TaskProcessor:
                         len(chunks),
                         time.perf_counter() - parsed_started,
                     )
-                documents.append(doc)
-                chunks_by_doc[doc.id] = chunks
-                all_chunks.extend(chunks)
+                    documents.append(doc)
+                    chunks_by_doc[doc.id] = chunks
+                    all_chunks.extend(chunks)
 
             if not documents:
                 raise RuntimeError("No PDF files found for SummaryGen")
             if not all_chunks:
                 raise RuntimeError("No text chunks extracted from selected PDF files")
 
+            document_profiles_enabled = (
+                settings.lecture_document_profiles_enabled
+                or len(documents) >= settings.lecture_large_corpus_profile_min_docs
+            )
+            if document_profiles_enabled and not settings.lecture_document_profiles_enabled:
+                logger.info(
+                    "SummaryGen document profiles auto-enabled for large corpus summaryId=%s docs=%d threshold=%d",
+                    summary_id,
+                    len(documents),
+                    settings.lecture_large_corpus_profile_min_docs,
+                )
+
             policy = build_context_policy(
                 doc_count=len(documents),
                 total_chunks=len(all_chunks),
-                document_profiles_enabled=settings.lecture_document_profiles_enabled,
+                document_profiles_enabled=document_profiles_enabled,
             )
             logger.info(
                 "SummaryGen context policy summaryId=%s target_words=%d sections=%d plan_chunks=%d section_chunks=%d plan_pool=%d section_pool=%d profiles_enabled=%s",
@@ -1603,7 +1667,7 @@ class TaskProcessor:
                 policy.section_context_chunks,
                 policy.plan_pool_k,
                 policy.section_pool_k,
-                settings.lecture_document_profiles_enabled,
+                document_profiles_enabled,
             )
 
             retriever_started = time.perf_counter()
@@ -1642,7 +1706,7 @@ class TaskProcessor:
 
             topic = LectureTopic(
                 id=str(summary_file_id),
-                title=lecture_title,
+                title=_lecture_title_for_theme(theme_name, theme_id),
                 description="Автоматически сгенерированная лекция.",
                 difficulty=DifficultyLevel.MEDIUM,
                 keywords=[],
@@ -1675,8 +1739,8 @@ class TaskProcessor:
                 context_token_budget=policy.plan_context_token_budget,
                 document_profiles=document_profiles,
                 additional_requirements=additional_req,
-                min_sections=policy.target_sections,
-                max_sections=policy.target_sections,
+                min_sections=settings.lecture_min_sections,
+                max_sections=settings.lecture_max_sections,
             )
             logger.info("SummaryGen lecture plan built summaryId=%s sections=%d", summary_id, len(plan.sections))
 
@@ -1701,7 +1765,7 @@ class TaskProcessor:
             await asyncio.to_thread(markdown_to_pdf, summary_path, pdf_path)
             logger.info("SummaryGen PDF exported summaryId=%s path=%s", summary_id, pdf_path)
 
-            file_name = lecture_title
+            file_name = _lecture_title_for_theme(theme_name, theme_id)
             s3_key = await asyncio.to_thread(
                 self.s3.upload_file_to_bucket,
                 local_path=str(pdf_path),
@@ -2005,10 +2069,69 @@ class TaskProcessor:
                 num_long_answer=num_essay,
             )
 
-            raw_questions = await generate_quiz_from_text(note_text, cfg, theme_name=theme_name)
-            logger.info("QuizGen raw questions generated quizId=%s count=%d", quiz_id, len(raw_questions))
-            quiz_questions = self._convert_raw_to_quiz_questions(raw_questions, allowed_types=internal_allowed)
-            logger.info("QuizGen questions converted quizId=%s count=%d", quiz_id, len(quiz_questions))
+            quiz_questions: list[QuizQuestion] = []
+            accepted_question_keys: set[str] = set()
+            attempts = max(1, settings.quiz_generation_fill_max_attempts)
+            for attempt in range(1, attempts + 1):
+                remaining = question_count - len(quiz_questions)
+                if remaining <= 0:
+                    break
+                attempt_cfg = cfg if attempt == 1 else _quiz_config_from_ui_counts(
+                    _distribute_question_counts(total=remaining, ui_types=raw_qtypes)
+                )
+                existing_texts = [question.text for question in quiz_questions]
+                raw_questions = await generate_quiz_from_text(
+                    note_text,
+                    attempt_cfg,
+                    theme_name=theme_name,
+                    existing_question_texts=existing_texts,
+                )
+                logger.info(
+                    "QuizGen raw questions generated quizId=%s attempt=%d remaining=%d raw_count=%d existing_questions=%d",
+                    quiz_id,
+                    attempt,
+                    remaining,
+                    len(raw_questions),
+                    len(existing_texts),
+                )
+                converted = self._convert_raw_to_quiz_questions(raw_questions, allowed_types=internal_allowed)
+                added = 0
+                for question in converted:
+                    key = _question_text_key(question.text)
+                    if not key or key in accepted_question_keys:
+                        logger.info(
+                            "QuizGen skipped duplicate generated question quizId=%s attempt=%d question=%s",
+                            quiz_id,
+                            attempt,
+                            question.text[:120],
+                        )
+                        continue
+                    quiz_questions.append(question)
+                    accepted_question_keys.add(key)
+                    added += 1
+                    if len(quiz_questions) >= question_count:
+                        break
+                logger.info(
+                    "QuizGen questions converted quizId=%s attempt=%d converted=%d added=%d total=%d target=%d",
+                    quiz_id,
+                    attempt,
+                    len(converted),
+                    added,
+                    len(quiz_questions),
+                    question_count,
+                )
+                if added == 0 and attempt > 1:
+                    logger.warning(
+                        "QuizGen refill attempt produced no accepted questions quizId=%s attempt=%d remaining=%d",
+                        quiz_id,
+                        attempt,
+                        question_count - len(quiz_questions),
+                    )
+
+            if len(quiz_questions) < question_count:
+                raise RuntimeError(
+                    f"QuizGen generated only {len(quiz_questions)} valid unique questions out of requested {question_count}"
+                )
 
             await self._generate_explanations_for_quiz(
                 lecture_md=note_text,

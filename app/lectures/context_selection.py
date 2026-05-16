@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from app.api.core.config import settings
 from app.curriculum.models import LectureTopic
 from app.documents.chunking import estimate_tokens
 from app.documents.indexers.base import BaseRetriever
@@ -179,10 +180,23 @@ async def build_document_profiles(
         max_tokens: int,
 ) -> list[DocumentProfile]:
     profiles: list[DocumentProfile] = []
+    llm_profiles_enabled = len(documents) <= settings.lecture_doc_profile_llm_max_docs
+    if not llm_profiles_enabled:
+        logger.info(
+            "Document profiles using extractive mode docs=%d llm_max_docs=%d",
+            len(documents),
+            settings.lecture_doc_profile_llm_max_docs,
+        )
+
     for doc in documents:
         chunks = list(chunks_by_doc.get(doc.id, []))
         if not chunks:
             profiles.append(_fallback_profile(doc, [], "document has no chunks"))
+            continue
+
+        if not llm_profiles_enabled:
+            selected = _representative_chunks(chunks, chunks_per_doc)
+            profiles.append(_fallback_profile(doc, selected, "large corpus extractive profile"))
             continue
 
         selected = _representative_chunks(chunks, chunks_per_doc)

@@ -21,42 +21,38 @@ GENERATION_SYSTEM_PROMPT = """
 
 
 def build_requirements(cfg: QuizGenerationConfig) -> str:
-    """
-    Текст, описывающий, какие типы и сколько вопросов нужно сгенерировать.
-    Это отражение флагов/количеств из QuizGenerationConfig.
-    """
     parts: List[str] = []
 
     if cfg.generate_true_false and cfg.num_true_false > 0:
         parts.append(
             f"- {cfg.num_true_false} вопросов формата True/False "
-            f"(ответ 'true' или 'false' в JSON)."
+            f"(ответ true или false в JSON)."
         )
 
     if cfg.generate_multiple_choice and cfg.num_multiple_choice > 0:
         parts.append(
             f"- {cfg.num_multiple_choice} вопросов Multiple Choice "
-            f"с 4–6 вариантами ответа. В JSON поле 'options', "
-            f"a 'answer' — индекс правильного варианта (0-based)."
+            f"с 4-6 вариантами ответа. В JSON поле 'options', "
+            f"а 'answer' - индекс правильного варианта (0-based)."
         )
 
     if cfg.generate_select_all_that_apply and cfg.num_select_all_that_apply > 0:
         parts.append(
             f"- {cfg.num_select_all_that_apply} вопросов Select All That Apply "
-            f"с 4–6 вариантами. 'options' — список вариантов, "
-            f"'answer' — массив индексов всех правильных вариантов."
+            f"с 4-6 вариантами. 'options' - список вариантов, "
+            f"'answer' - массив индексов всех правильных вариантов."
         )
 
     if cfg.generate_fill_in_the_blank and cfg.num_fill_in_the_blank > 0:
         parts.append(
             f"- {cfg.num_fill_in_the_blank} вопросов Fill in the Blank. "
-            f"В тексте вопроса явно помечай пропуски (например, подчёркиванием). "
-            f"В JSON 'answer' — массив возможных правильных ответов (строки)."
+            f"В тексте вопроса явно помечай пропуски. "
+            f"В JSON 'answer' - массив возможных правильных ответов."
         )
 
     if cfg.generate_matching and cfg.num_matching > 0:
         parts.append(
-            f"- {cfg.num_matching} вопросов Matching. В JSON 'answer' — массив объектов "
+            f"- {cfg.num_matching} вопросов Matching. В JSON 'answer' - массив объектов "
             f"{{'leftOption': '...', 'rightOption': '...'}}."
         )
 
@@ -69,17 +65,17 @@ def build_requirements(cfg: QuizGenerationConfig) -> str:
     if cfg.generate_long_answer and cfg.num_long_answer > 0:
         parts.append(
             f"- {cfg.num_long_answer} вопросов Long Answer "
-            f"(развёрнутый текстовый ответ)."
+            f"(развернутый текстовый ответ)."
         )
 
     return "\n".join(parts)
 
 
-def build_user_prompt(cfg: QuizGenerationConfig, theme_name: Optional[str] = None) -> str:
-    """
-    Финальный user-prompt, который мы отправляем в LLM вместе с текстом конспекта.
-    Здесь описываем формат JSON и правила для поля answer.
-    """
+def build_user_prompt(
+        cfg: QuizGenerationConfig,
+        theme_name: Optional[str] = None,
+        existing_question_texts: Optional[List[str]] = None,
+) -> str:
     requirements = build_requirements(cfg)
 
     theme_block = ""
@@ -88,6 +84,20 @@ def build_user_prompt(cfg: QuizGenerationConfig, theme_name: Optional[str] = Non
             f"Тема квиза: «{theme_name}».\n"
             f"Все вопросы должны относиться именно к этой теме и опираться на предоставленный учебный текст.\n\n"
         )
+
+    duplicate_guard = ""
+    if existing_question_texts:
+        existing_lines = "\n".join(
+            f"- {text.strip()}"
+            for text in existing_question_texts
+            if text and text.strip()
+        )
+        if existing_lines:
+            duplicate_guard = (
+                "Уже принятые вопросы, которые нельзя повторять или переформулировать слишком близко:\n"
+                f"{existing_lines}\n\n"
+                "Сгенерируй новые вопросы по другим аспектам материала. Не дублируй смысл уже принятых вопросов.\n\n"
+            )
 
     format_description = """
 Используй следующий JSON-формат:
@@ -129,8 +139,8 @@ def build_user_prompt(cfg: QuizGenerationConfig, theme_name: Optional[str] = Non
 """.strip()
 
     return f"""
-Выше приведён учебный текст (конспект).
-{theme_block}Сгенерируй экзаменационные вопросы по этому тексту.
+Выше приведен учебный текст.
+{theme_block} {duplicate_guard} По этому тексту сгенерируй экзаменационные вопросы.
 
 Требования к количеству и типам вопросов:
 {requirements}
@@ -145,5 +155,5 @@ def build_user_prompt(cfg: QuizGenerationConfig, theme_name: Optional[str] = Non
 
 {format_description}
 
-ВЕРНИ ТОЛЬКО ОДИН JSON-ОБЪЕКТ, без пояснений, комментариев, Markdown-блоков и т.п.
+Верни только один JSON-объект, без пояснений, комментариев, Markdown-блоков и т.п.
 """.strip()

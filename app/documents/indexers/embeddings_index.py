@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import List, Tuple
 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 from app.documents.chunking import estimate_tokens, split_long_text
+from app.documents.index_cache import normalize_embeddings
 from app.documents.indexers.base import BaseRetriever
 from app.documents.models import DocumentChunk
 from app.services.embeddings_client import OpenAIEmbeddingsClient
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingsRetriever(BaseRetriever):
@@ -66,7 +70,7 @@ class EmbeddingsRetriever(BaseRetriever):
             return
 
         self._chunks = safe_chunks
-        self._embeddings = np.asarray(embeddings, dtype="float32")
+        self._embeddings = normalize_embeddings(np.asarray(embeddings, dtype="float32"))
 
     def index_precomputed(self, chunks: List[DocumentChunk], embeddings: np.ndarray | List[List[float]]) -> None:
         if not chunks:
@@ -83,7 +87,7 @@ class EmbeddingsRetriever(BaseRetriever):
             )
 
         self._chunks = list(chunks)
-        self._embeddings = array
+        self._embeddings = normalize_embeddings(array)
 
     def search(self, query: str, top_k: int = 5) -> List[Tuple[DocumentChunk, float]]:
         """
@@ -96,14 +100,28 @@ class EmbeddingsRetriever(BaseRetriever):
         if not query_embeddings:
             return []
 
-        q_vec = np.asarray(query_embeddings[0], dtype="float32").reshape(1, -1)
-        sims = cosine_similarity(q_vec, self._embeddings)[0]  # 1D: N
+        started = time.perf_counter()
+        q_vec = normalize_embeddings(np.asarray(query_embeddings[0], dtype="float32").reshape(1, -1))[0]
+        sims = np.dot(self._embeddings, q_vec)
+        limit = min(max(int(top_k), 0), sims.shape[0])
+        if limit <= 0:
+            return []
 
-        indexed_scores = list(enumerate(sims))
-        indexed_scores.sort(key=lambda x: x[1], reverse=True)
+        if limit == sims.shape[0]:
+            top_indexes = np.argsort(sims)[::-1]
+        else:
+            candidate_indexes = np.argpartition(sims, -limit)[-limit:]
+            top_indexes = candidate_indexes[np.argsort(sims[candidate_indexes])[::-1]]
 
         results: List[Tuple[DocumentChunk, float]] = []
-        for idx, score in indexed_scores[:top_k]:
+        for idx in top_indexes:
+            score = sims[idx]
             results.append((self._chunks[idx], float(score)))
+        logger.debug(
+            "Embeddings search finished chunks=%d top_k=%d seconds=%.4f",
+            len(self._chunks),
+            top_k,
+            time.perf_counter() - started,
+        )
 
         return results

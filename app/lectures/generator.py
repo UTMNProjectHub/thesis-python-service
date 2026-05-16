@@ -26,6 +26,11 @@ LECTURE_SECTION_SYSTEM_PROMPT = """
 - не пиши заключение всей лекции, если это не последняя секция;
 - пиши связно, академично, но понятно студенту;
 - не создавай отдельный блок "Ключевые тезисы": он будет добавлен внешним кодом перед текстом секции.
+- раскрывай только тему текущей секции;
+- если в контексте встречаются материалы для других секций, не пересказывай их;
+- не повторяй определения, примеры и практические задания из других секций;
+- смежные темы можно упоминать только кратко, в 1-2 предложениях, если это нужно для связи;
+- не добавляй итоговый обзор всей лекции в конце каждой секции;
 
 Формат:
 - Markdown;
@@ -70,6 +75,8 @@ async def generate_section_markdown(
         retrieval_pool_k: int | None = None,
         context_token_budget: int | None = None,
         additional_requirements: str = "",
+        covered_section_titles: Optional[List[str]] = None,
+        other_section_titles: Optional[List[str]] = None,
 ) -> str:
     """
     Генерирует текст ОДНОЙ секции лекции в формате Markdown.
@@ -134,6 +141,27 @@ async def generate_section_markdown(
             parts.append("последняя секция")
         else:
             parts.append("средняя секция")
+        parts.append("")
+
+    if other_section_titles:
+        parts.append("Другие секции плана, которые нельзя подробно раскрывать в этой секции:")
+        for title in other_section_titles:
+            title = title.strip()
+            if title:
+                parts.append(f"- {title}")
+        parts.append("")
+        parts.append(
+            "Если учебные фрагменты содержат материал по этим секциям, используй его только как контекст, "
+            "но не пересказывай и не раскрывай подробно."
+        )
+        parts.append("")
+
+    if covered_section_titles:
+        parts.append("Темы, которые уже были раскрыты ранее и не должны повторяться подробно:")
+        for title in covered_section_titles:
+            title = title.strip()
+            if title:
+                parts.append(f"- {title}")
         parts.append("")
 
     if topic_description:
@@ -272,7 +300,10 @@ async def generate_lecture_markdown(
     lines.append(f"# {plan.topic_title}")
     lines.append("")
 
-    for section in plan.sorted_sections():
+    sorted_sections = plan.sorted_sections()
+    covered_section_titles: List[str] = []
+
+    for section in sorted_sections:
         # Заголовок секции
         lines.append(f"## {section.title}")
         lines.append("")
@@ -281,6 +312,12 @@ async def generate_lecture_markdown(
         if key_points_block:
             lines.append(key_points_block)
             lines.append("")
+
+        other_section_titles = [
+            other.title
+            for other in sorted_sections
+            if other.id != section.id
+        ]
 
         # Генерируем текст секции
         section_md = await generate_section_markdown(
@@ -293,10 +330,13 @@ async def generate_lecture_markdown(
             retrieval_pool_k=retrieval_pool_k,
             context_token_budget=context_token_budget,
             additional_requirements=additional_requirements,
+            covered_section_titles=covered_section_titles,
+            other_section_titles=other_section_titles,
         )
 
         lines.append(section_md)
         lines.append("")  # пустая строка-разделитель
+        covered_section_titles.append(section.title)
 
     markdown = "\n".join(lines).strip()
     if final_edit_enabled:
