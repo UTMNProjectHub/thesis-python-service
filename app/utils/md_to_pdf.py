@@ -231,14 +231,30 @@ def _build_styles(font_name: str) -> dict[str, ParagraphStyle]:
 
 
 def _inline_markdown(text: str, font_name: str) -> str:
-    text = html.escape(text.strip())
+    text = text.strip()
+    if not text:
+        return ""
+
+    code_placeholders: dict[str, str] = {}
+
+    def protect_code(match: re.Match[str]) -> str:
+        key = f"@@CODE_{len(code_placeholders)}@@"
+        code_text = html.escape(match.group(1), quote=False)
+        code_placeholders[key] = (
+            f'<font name="{font_name}" backColor="#f2f4f7">{code_text}</font>'
+        )
+        return key
+
+    text = re.sub(r"`([^`\n]+)`", protect_code, text)
+    text = html.escape(text, quote=False)
     text = _replace_unicode_scripts(text)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
-    text = re.sub(r"`([^`]+)`", rf'<font name="{font_name}" backColor="#f2f4f7">\1</font>', text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"__([^_]+)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", text)
+
+    for key, value in code_placeholders.items():
+        text = text.replace(key, value)
+
     return text
 
 
@@ -369,13 +385,41 @@ def _markdown_to_flowables(markdown: str, styles: dict[str, ParagraphStyle], fon
 
         if stripped.startswith("```"):
             flush_paragraph()
+
             code_lines: List[str] = []
             i += 1
-            while i < len(lines) and not lines[i].strip().startswith("```"):
-                code_lines.append(lines[i])
-                i += 1
-            if i < len(lines):
-                i += 1
+
+            closing_index: int | None = None
+            j = i
+            while j < len(lines):
+                if lines[j].strip().startswith("```"):
+                    closing_index = j
+                    break
+                j += 1
+
+            if closing_index is not None:
+                code_lines = lines[i:closing_index]
+                i = closing_index + 1
+
+            else:
+                logger.warning(
+                    "Unclosed fenced code block detected in markdown_to_pdf; "
+                    "recovering before next markdown heading"
+                )
+
+                while i < len(lines):
+                    current = lines[i]
+                    current_stripped = current.strip()
+
+                    if re.match(r"^#{2,6}\s+\S+", current_stripped):
+                        break
+
+                    if _horizontal_rule(current_stripped) and code_lines:
+                        break
+
+                    code_lines.append(current)
+                    i += 1
+
             flowables.append(Preformatted("\n".join(code_lines), styles["code"]))
             flowables.append(Spacer(1, 5))
             continue

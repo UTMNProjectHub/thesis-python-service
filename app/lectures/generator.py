@@ -10,6 +10,59 @@ from app.lectures.models import LecturePlan, LectureSection
 from app.lectures.planner import _build_context_from_chunks, _difficulty_comment
 from app.services.proxy_client import proxy_completion
 
+LECTURE_SECTION_SYSTEM_PROMPT = """
+Ты — преподаватель и автор учебных лекций на русском языке.
+
+Твоя задача — написать содержательную секцию лекции по заданному плану и учебным фрагментам.
+
+Правила:
+- строго придерживайся темы секции;
+- раскрой все переданные ключевые тезисы;
+- не удаляй и не подменяй смысл ключевых тезисов;
+- используй учебные фрагменты как фактическую основу;
+- если в материалах есть определения, механизмы, этапы, формулы, примеры или ограничения — включай их в объяснение;
+- не добавляй внутренние source ids, file ids, page references или chunk ids;
+- не пиши вводную обо всей лекции, если это не первая секция;
+- не пиши заключение всей лекции, если это не последняя секция;
+- пиши связно, академично, но понятно студенту;
+- не создавай отдельный блок "Ключевые тезисы": он будет добавлен внешним кодом перед текстом секции.
+- раскрывай только тему текущей секции;
+- если в контексте встречаются материалы для других секций, не пересказывай их;
+- не повторяй определения, примеры и практические задания из других секций;
+- смежные темы можно упоминать только кратко, в 1-2 предложениях, если это нужно для связи;
+- не добавляй итоговый обзор всей лекции в конце каждой секции;
+
+Формат:
+- Markdown;
+- не используй заголовок уровня #;
+- допускаются ##, ###, списки, таблицы и короткие примеры;
+- секция должна быть достаточно подробной для самостоятельного изучения.
+""".strip()
+
+LECTURE_POLISH_SYSTEM_PROMPT = """
+Ты — редактор русскоязычных учебных лекций.
+
+Улучши связность, ясность и академический стиль текста, не меняя структуру лекции.
+
+Строгие правила:
+- сохрани все заголовки секций;
+- сохрани каждый блок "Ключевые тезисы";
+- не удаляй тезисы и не объединяй их в обычный текст;
+- не удаляй важные определения, этапы, примеры и выводы;
+- убирай только повторы, шероховатости и слабые формулировки;
+- не добавляй source ids, page references, file ids или технические комментарии;
+- верни только итоговый Markdown.
+""".strip()
+
+
+def _format_key_points_block(section: LectureSection) -> str:
+    key_points = [point.strip() for point in section.key_points if point and point.strip()]
+    if not key_points:
+        return ""
+    lines = ["### Ключевые тезисы", ""]
+    lines.extend(f"- {point}" for point in key_points)
+    return "\n".join(lines).strip()
+
 
 async def generate_section_markdown(
         plan: LecturePlan,
@@ -22,6 +75,8 @@ async def generate_section_markdown(
         retrieval_pool_k: int | None = None,
         context_token_budget: int | None = None,
         additional_requirements: str = "",
+        covered_section_titles: Optional[List[str]] = None,
+        other_section_titles: Optional[List[str]] = None,
 ) -> str:
     """
     Генерирует текст ОДНОЙ секции лекции в формате Markdown.
@@ -64,22 +119,7 @@ async def generate_section_markdown(
 
     difficulty_hint = _difficulty_comment(plan.difficulty)
 
-    # --- 2. Системный промпт ---
-    system_prompt = (
-        "Ты — преподаватель вуза и автор конспектов лекций.\n"
-        "Тебе даётся тема лекции, тема конкретной секции, её краткое резюме, "
-        "ключевые тезисы и фрагменты из учебных материалов.\n"
-        "Твоя задача — написать развернутый текст СЕКЦИИ лекции на русском языке "
-        "в формате Markdown.\n\n"
-        "Требования:\n"
-        "- не пиши заголовок уровня # (это делает внешний код),\n"
-        "- можно использовать подзаголовки уровней ## и ### ВНУТРИ секции при необходимости,\n"
-        "- раскрывай key_points в связный текст, а не просто копируй их списком,\n"
-        "- при необходимости можно добавлять списки, таблицы, примеры кода и фрагменты SQL,\n"
-        "- опирайся на переданные фрагменты контекста, но переформулируй своими словами,\n"
-        "- не добавляй ссылки на источники, идентификаторы F1/F2, S3-пути или номера страниц,\n"
-        "- объём — ориентировочно 1–3 печатные страницы в зависимости от сложности.\n"
-    )
+    system_prompt = LECTURE_SECTION_SYSTEM_PROMPT
 
     # --- 3. User prompt: описание секции + контекст ---
     parts: List[str] = []
@@ -91,6 +131,38 @@ async def generate_section_markdown(
     parts.append("Тема секции лекции:")
     parts.append(section.title)
     parts.append("")
+
+    sorted_sections = plan.sorted_sections()
+    if sorted_sections:
+        parts.append("Позиция секции в лекции:")
+        if section.id == sorted_sections[0].id:
+            parts.append("первая секция")
+        elif section.id == sorted_sections[-1].id:
+            parts.append("последняя секция")
+        else:
+            parts.append("средняя секция")
+        parts.append("")
+
+    if other_section_titles:
+        parts.append("Другие секции плана, которые нельзя подробно раскрывать в этой секции:")
+        for title in other_section_titles:
+            title = title.strip()
+            if title:
+                parts.append(f"- {title}")
+        parts.append("")
+        parts.append(
+            "Если учебные фрагменты содержат материал по этим секциям, используй его только как контекст, "
+            "но не пересказывай и не раскрывай подробно."
+        )
+        parts.append("")
+
+    if covered_section_titles:
+        parts.append("Темы, которые уже были раскрыты ранее и не должны повторяться подробно:")
+        for title in covered_section_titles:
+            title = title.strip()
+            if title:
+                parts.append(f"- {title}")
+        parts.append("")
 
     if topic_description:
         parts.append("Краткое описание темы курса:")
@@ -172,17 +244,13 @@ async def polish_lecture_markdown(
             )
         return "\n\n".join(part for part in polished_parts if part.strip()).strip()
 
-    system_prompt = (
-        "You are an academic Russian lecture editor. Improve coherence, remove repeated ideas, "
-        "smooth transitions, and fix contradictions. Preserve Markdown structure and technical meaning. "
-        "Do not add citations, source links, fragment ids like F1/F2, S3 paths, or page references."
-    )
+    system_prompt = LECTURE_POLISH_SYSTEM_PROMPT
     user_prompt = "\n".join(
         part
         for part in [
-            f"Lecture title: {plan.topic_title}",
-            f"Additional requirements: {additional_requirements}" if additional_requirements.strip() else "",
-            "Return only the edited Markdown.",
+            f"Название лекции: {plan.topic_title}",
+            f"Дополнительные требования: {additional_requirements}" if additional_requirements.strip() else "",
+            "Верни только отредактированный Markdown.",
         ]
         if part
     )
@@ -232,10 +300,24 @@ async def generate_lecture_markdown(
     lines.append(f"# {plan.topic_title}")
     lines.append("")
 
-    for section in plan.sorted_sections():
+    sorted_sections = plan.sorted_sections()
+    covered_section_titles: List[str] = []
+
+    for section in sorted_sections:
         # Заголовок секции
         lines.append(f"## {section.title}")
         lines.append("")
+
+        key_points_block = _format_key_points_block(section)
+        if key_points_block:
+            lines.append(key_points_block)
+            lines.append("")
+
+        other_section_titles = [
+            other.title
+            for other in sorted_sections
+            if other.id != section.id
+        ]
 
         # Генерируем текст секции
         section_md = await generate_section_markdown(
@@ -248,10 +330,13 @@ async def generate_lecture_markdown(
             retrieval_pool_k=retrieval_pool_k,
             context_token_budget=context_token_budget,
             additional_requirements=additional_requirements,
+            covered_section_titles=covered_section_titles,
+            other_section_titles=other_section_titles,
         )
 
         lines.append(section_md)
         lines.append("")  # пустая строка-разделитель
+        covered_section_titles.append(section.title)
 
     markdown = "\n".join(lines).strip()
     if final_edit_enabled:

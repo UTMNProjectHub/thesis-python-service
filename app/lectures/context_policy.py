@@ -45,7 +45,7 @@ def build_context_policy(
 
     target_sections = _clamp_int(round(target / words_per_section), min_sections, max_sections)
     section_words = target / max(1, target_sections)
-    section_output_tokens = _clamp_int(round(section_words * 1.8), 900, 2600)
+    section_output_tokens = _clamp_int(round(section_words * 1.8), 1200, 4200)
 
     doc_scale = _clamp(1 + math.log2(docs) * 0.35, 1.0, 2.5)
     corpus_scale = _clamp(1 + math.log2(max(chunks, 80) / 80) * 0.25, 1.0, 2.0)

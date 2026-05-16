@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from app.api.core.config import settings
 from app.curriculum.models import LectureTopic
 from app.documents.chunking import estimate_tokens
 from app.documents.indexers.base import BaseRetriever
@@ -179,29 +180,44 @@ async def build_document_profiles(
         max_tokens: int,
 ) -> list[DocumentProfile]:
     profiles: list[DocumentProfile] = []
+    llm_profiles_enabled = len(documents) <= settings.lecture_doc_profile_llm_max_docs
+    if not llm_profiles_enabled:
+        logger.info(
+            "Document profiles using extractive mode docs=%d llm_max_docs=%d",
+            len(documents),
+            settings.lecture_doc_profile_llm_max_docs,
+        )
+
     for doc in documents:
         chunks = list(chunks_by_doc.get(doc.id, []))
         if not chunks:
             profiles.append(_fallback_profile(doc, [], "document has no chunks"))
             continue
 
+        if not llm_profiles_enabled:
+            selected = _representative_chunks(chunks, chunks_per_doc)
+            profiles.append(_fallback_profile(doc, selected, "large corpus extractive profile"))
+            continue
+
         selected = _representative_chunks(chunks, chunks_per_doc)
         context = _profile_context(selected, token_budget=max(500, chunks_per_doc * 700))
 
         system_prompt = (
-            "You create compact Russian study-material profiles for lecture generation. "
-            "Return plain text only. Do not include citations, URLs, or source references."
+            "Ты составляешь компактный профиль учебного материала для последующей генерации лекции. "
+            "Пиши на русском языке. Выделяй только факты и темы, полезные для лекции. "
+            "Не добавляй citations, URLs, source ids, file ids, page references или технические ссылки. "
+            "Верни только обычный текст без Markdown-таблиц."
         )
         user_prompt = "\n".join(
             part
             for part in [
-                f"Lecture topic: {topic.title}",
-                f"Document title: {doc.title or doc.id}",
-                f"Pages: {doc.pages}, chunks: {len(chunks)}",
-                f"Additional requirements: {additional_requirements}" if additional_requirements else "",
-                "Create two sections in Russian:",
-                "1. Summary: 5-8 sentences about useful content for the lecture.",
-                "2. Coverage: key chapters/topics/pages covered by this document.",
+                f"Тема лекции: {topic.title}",
+                f"Название документа: {doc.title or doc.id}",
+                f"Страниц: {doc.pages}, фрагментов: {len(chunks)}",
+                f"Дополнительные требования: {additional_requirements}" if additional_requirements else "",
+                "Создай два раздела:",
+                "1. Summary: 5-8 предложений о содержании документа, полезном для лекции.",
+                "2. Coverage: основные темы, разделы и понятия, которые покрывает документ.",
                 "",
                 context,
             ]

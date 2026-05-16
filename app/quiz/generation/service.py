@@ -13,6 +13,7 @@ async def generate_quiz_from_text(
         note_text: str,
         cfg: Optional[QuizGenerationConfig] = None,
         theme_name: Optional[str] = None,
+        existing_question_texts: Optional[List[str]] = None,
 ) -> List[Question]:
     """
     Главная функция генерации квиза.
@@ -23,7 +24,11 @@ async def generate_quiz_from_text(
     if cfg is None:
         cfg = QuizGenerationConfig()
 
-    user_prompt = build_user_prompt(cfg, theme_name=theme_name)
+    user_prompt = build_user_prompt(
+        cfg,
+        theme_name=theme_name,
+        existing_question_texts=existing_question_texts,
+    )
 
     raw_answer, _ = await proxy_completion(
         text=note_text,

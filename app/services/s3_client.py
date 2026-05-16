@@ -3,14 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import mimetypes
 import os
+import re
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from minio import Minio
 from minio.error import S3Error
@@ -21,6 +23,25 @@ logger = logging.getLogger(__name__)
 
 FILES_DIR = Path("files_materials")
 FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _safe_upload_name(original_name: str | None, local_path: str) -> str:
+    local = Path(local_path)
+    raw_name = str(original_name or local.name).strip()
+    raw_name = raw_name.replace("\\", "/").split("/")[-1].strip()
+    raw_name = re.sub(r"[\x00-\x1f\x7f]+", "", raw_name)
+    raw_name = raw_name.strip(" .") or local.name or "file"
+
+    local_suffix = local.suffix
+    if local_suffix and not Path(raw_name).suffix:
+        raw_name = f"{raw_name}{local_suffix}"
+
+    return raw_name
+
+
+def _ascii_metadata_value(value: str) -> str:
+    encoded = quote(value, safe=" ._-()[]")
+    return encoded.encode("ascii", "ignore").decode("ascii") or "file"
 
 
 class _FileLock:
@@ -945,30 +966,26 @@ class S3Client:
             user_id: Optional[str] = None,
     ) -> str:
         local_path = str(local_path)
-        if original_name is None:
-            original_name = os.path.basename(local_path)
-
-        safe_name = original_name.encode("ascii", "ignore").decode("ascii") or "file"
+        safe_name = _safe_upload_name(original_name, local_path)
         file_id = str(uuid.uuid4())
+        file_hash = self.compute_file_hash(local_path)
+        suffix = Path(safe_name).suffix or Path(local_path).suffix
+        hashed_name = f"{file_hash}{suffix}"
 
-        if user_id:
-            if bucket:
-                object_name = f"{bucket}/{file_id}_{safe_name}"
-            else:
-                object_name = f"{user_id}/{file_id}_{safe_name}"
+        if bucket:
+            object_name = f"{bucket.strip('/')}/{hashed_name}"
+        elif user_id:
+            object_name = f"{str(user_id).strip('/')}/{hashed_name}"
         else:
-            if bucket:
-                object_name = f"{bucket}{file_id}_{safe_name}"
-            else:
-                object_name = f"{file_id}_{safe_name}"
+            object_name = hashed_name
         object_name = self._object_candidates(object_name)[0]
 
-        file_hash = self.compute_file_hash(local_path)
         metadata = {
             "file_id": file_id,
-            "original_name": safe_name,
+            "original_name": _ascii_metadata_value(safe_name),
             "file_hash": file_hash,
         }
+        content_type = mimetypes.guess_type(safe_name)[0]
 
         try:
             logger.info(
@@ -984,6 +1001,7 @@ class S3Client:
                 self.bucket_name,
                 object_name,
                 local_path,
+                content_type=content_type,
                 metadata=metadata,
             )
             logger.info("S3 bucket upload finished bucket=%s object=%s", self.bucket_name, object_name)

@@ -96,45 +96,52 @@ def parse_faq_from_json(raw: str) -> List[FAQItem]:
 def build_faq_prompt(cfg: FAQGenerationConfig) -> tuple[str, str]:
     detail_level = normalize_faq_detail_level(cfg.detail_level)
     detail_hint = {
-        "low": "Short answers, no extra detail, but preserve the meaning.",
-        "medium": "Medium detail: explain key ideas and add useful examples.",
-        "high": "Detailed answers with context, explanations, and educational examples.",
+        "low": "Короткие ответы без лишних деталей, но с сохранением смысла.",
+        "medium": "Средняя детализация: объясняй ключевые идеи и добавляй полезные примеры.",
+        "high": "Подробные ответы с контекстом, объяснениями и учебными примерами.",
     }[detail_level]
 
     system_prompt = """
-You are an expert at creating FAQ materials for educational lecture notes.
-Write all questions and answers in Russian.
-Use only the provided lecture text.
-Return strict JSON only, without Markdown or explanations.
+Ты — преподаватель, который готовит FAQ по учебной лекции.
+
+Твоя задача:
+- составлять вопросы и ответы только по предоставленному тексту лекции;
+- покрывать основные понятия, определения, типичные непонимания и практические выводы;
+- группировать вопросы по понятным смысловым категориям;
+- писать вопросы так, как их мог бы задать студент после изучения лекции;
+- отвечать ясно, по-русски и в выбранном уровне детализации;
+- не добавлять факты, которых нет в лекции;
+- не показывать source ids, file ids, page references, chunk ids или source anchors;
+- возвращать только строгий JSON без Markdown и пояснений.
 """.strip()
 
     parts = [
-        f"Generate {cfg.num_questions} FAQ questions from the lecture text below.",
-        "Questions must cover key concepts, definitions, practical conclusions, and common misunderstandings.",
-        "Group questions by meaningful categories.",
-        f"Detail level: {detail_hint}",
+        f"Сгенерируй {cfg.num_questions} FAQ-вопросов по тексту лекции ниже.",
+        "Вопросы должны покрывать ключевые понятия, определения, практические выводы и типичные непонимания.",
+        "Группируй вопросы по смысловым категориям.",
+        f"Уровень детализации: {detail_hint}",
     ]
 
     additional_requirements = (cfg.additional_requirements or "").strip()
     if additional_requirements:
-        parts.extend(["", "Additional requirements:", additional_requirements])
+        parts.extend(["", "Дополнительные требования:", additional_requirements])
 
     if cfg.batch_count > 1:
         parts.extend(
             [
                 "",
-                f"FAQ batch: {cfg.batch_index} of {cfg.batch_count}.",
-                "Generate only this batch. Avoid repeating questions already generated in previous batches.",
+                f"Пакет FAQ: {cfg.batch_index} из {cfg.batch_count}.",
+                "Сгенерируй только этот пакет. Не повторяй вопросы, уже созданные в предыдущих пакетах.",
             ]
         )
         if cfg.avoid_questions:
-            parts.append("Previously generated questions to avoid:")
+            parts.append("Ранее созданные вопросы, которые нельзя повторять:")
             parts.extend(f"- {question}" for question in cfg.avoid_questions[:30])
 
     parts.extend(
         [
             "",
-            "JSON format:",
+            "JSON-формат:",
             """
 {
   "items": [
@@ -147,7 +154,7 @@ Return strict JSON only, without Markdown or explanations.
 }
 """.strip(),
             "",
-            "Lecture text:",
+            "Текст лекции:",
         ]
     )
 
