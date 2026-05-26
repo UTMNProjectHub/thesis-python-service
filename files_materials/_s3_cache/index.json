@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "entries": {
+    "8c739c8dad20abaa755e680845ad7f53f3584bc7a328185fb4f11b5ba792c568": {
+      "bucket": "thesis-bucket",
+      "object": "subjects/3/ПР5. Классы и объекты в языке Java.pdf",
+      "path": "files_materials\\_s3_cache\\8c739c8dad20abaa755e680845ad7f53f3584bc7a328185fb4f11b5ba792c568.pdf",
+      "size": 288574,
+      "etag": "6cb0a882dcb034825c7cd394d9e77b60",
+      "last_modified": "2026-03-17T11:11:17+00:00",
+      "metadata_file_hash": null,
+      "local_sha256": "d734cb41dcccbe3e9405a9c981a7136c28b739026384918c34dc716aca6f991d",
+      "unused_tasks": 0,
+      "last_used_at": "2026-05-26T09:52:55.265219+00:00"
+    },
+    "cb8e879502ed57e66a3b94413166342ffce492b2b6d6dc014627709218780db7": {
+      "bucket": "thesis-bucket",
+      "object": "themes/1/elibrary_45844833_29087045.pdf",
+      "path": "files_materials\\_s3_cache\\cb8e879502ed57e66a3b94413166342ffce492b2b6d6dc014627709218780db7.pdf",
+      "size": 251206,
+      "etag": "5e4613b48775c83c1f9be2c2d697903c",
+      "last_modified": "2026-03-03T10:28:43+00:00",
+      "metadata_file_hash": null,
+      "local_sha256": "deaa2bd92f8ee3e2cd1d1c9749b134bd0c7945f5fb97914b2a9c664c55867d4e",
+      "unused_tasks": 0,
+      "last_used_at": "2026-05-26T09:52:55.265264+00:00"
+    }
+  }
+}

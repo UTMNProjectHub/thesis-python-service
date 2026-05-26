@@ -17,7 +17,7 @@ from app.quiz.generation.service import generate_quiz_from_text
 from app.quiz.models import GeneratedQuiz as InternalQuiz
 from app.quiz.models import UserAnswer, CheckResponse
 from app.quiz.rag import SimpleVectorStore
-from app.services.proxy_client import proxy_completion
+from app.services.proxy_client import proxy_completion  
 from app.services.similarity import (
     cosine_similarity_pdfs_matrix,
     cosine_similarity_topics_from_json,
@@ -37,11 +37,32 @@ from app.v1.schemas import (
     TopicPairRequest,
 )
 
+from pydantic import BaseModel
+from app.services.embeddings_client import get_embeddings_sync 
+import asyncio
+
+class EmbeddingRequest(BaseModel):
+    text: str
+
+class EmbeddingResponse(BaseModel):
+    embedding: List[float]
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["v1"])
 
-
+@router.post("/embeddings", response_model=EmbeddingResponse)
+async def get_embedding(req: EmbeddingRequest):
+    try:
+        # get_embeddings_sync ожидает список строк, возвращает список списков
+        embeddings = await asyncio.to_thread(get_embeddings_sync, [req.text])
+        if not embeddings:
+            raise HTTPException(500, "Не удалось получить эмбеддинг")
+        return EmbeddingResponse(embedding=embeddings[0])
+    except Exception as e:
+        logger.error(f"Ошибка получения эмбеддинга: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
 @router.post("/complete", response_model=CompletionResponse)
 async def complete(req: CompletionRequest):
     try:

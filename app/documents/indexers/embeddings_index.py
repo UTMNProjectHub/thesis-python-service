@@ -9,6 +9,7 @@ from app.documents.chunking import estimate_tokens, split_long_text
 from app.documents.indexers.base import BaseRetriever
 from app.documents.models import DocumentChunk
 from app.services.embeddings_client import OpenAIEmbeddingsClient
+import requests
 
 
 class EmbeddingsRetriever(BaseRetriever):
@@ -55,8 +56,26 @@ class EmbeddingsRetriever(BaseRetriever):
             return
 
         safe_chunks = self._split_oversized_chunks(chunks)
-        texts = [c.text for c in safe_chunks]
-        embeddings = self.backend.embed_texts(texts)
+        # texts = [c.text for c in safe_chunks]  # больше не нужно
+
+        # Вместо одного вызова backend.embed_texts – поочерёдно через кэш-сервис
+        embeddings = []
+
+        for idx, chunk in enumerate(safe_chunks):
+            resp = requests.post(
+                "http://localhost:3000/embedding",
+                json={
+                    "text": chunk.text,
+                    "file_id": chunk.doc_id,           # UUID или строка
+                    "chunk_index": idx,                # порядковый номер
+                    "page_start": chunk.page_start,
+                    "page_end": chunk.page_end,
+                    "model_name": "intfloat/e5-large-v2",  # модель, которую использует Python-сервис
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            embeddings.append(resp.json()["embedding"])
 
         if not embeddings:
             self._chunks = []
